@@ -1,0 +1,17 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/*.db
+data/keys/
+.pytest_cache/
+.DS_Store
+
+# Credential files — never commit these
+razorpay_test_api_keys*.csv
+*_api_keys*.csv
+secrets/
+
+# Local working instructions for Claude Code - not for the public repo
+CLAUDE.md
