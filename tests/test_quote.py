@@ -152,3 +152,129 @@ def test_totals_is_immutable():
     t = compute_total([line("A", 499900)])
     with pytest.raises(Exception):
         t.total_paise = 1
+
+
+# --- issuing a quote --------------------------------------------------------
+#
+# create_quote takes ALREADY-RESOLVED lines. merchant/catalog.py imports
+# LineItem from this module, so importing resolve_lines back would be a
+# circular import. The layering is one-way on purpose: catalog resolves a
+# buyer's request into priced lines, quote turns priced lines into a total.
+
+import time
+
+from merchant.catalog import resolve_lines
+from merchant.quote import Quote, create_quote
+
+
+def shoes_and_socks():
+    return resolve_lines([{"sku": "NW-SHOE-001", "qty": 1}, {"sku": "NW-SOCK-001", "qty": 2}])
+
+
+def test_a_quote_carries_an_id_prefixed_so_it_is_recognisable_in_a_ledger():
+    q = create_quote(shoes_and_socks())
+    assert q.quote_id.startswith("qt_")
+
+
+def test_every_quote_gets_a_distinct_id():
+    """quote_id is the idempotency key for the whole payment path. Two quotes
+    sharing one would let a second cart settle against the first one's order."""
+    ids = {create_quote(shoes_and_socks()).quote_id for _ in range(100)}
+    assert len(ids) == 100
+
+
+def test_a_quote_expires_exactly_ttl_seconds_after_it_was_issued():
+    q = create_quote(shoes_and_socks())
+    assert q.expires_at - q.issued_at == config.QUOTE_TTL_SECONDS
+
+
+def test_a_fresh_quote_is_not_expired_but_is_one_second_past_its_ttl():
+    q = create_quote(shoes_and_socks())
+    assert not q.is_expired(now=q.issued_at)
+    assert not q.is_expired(now=q.expires_at)          # the boundary is still valid
+    assert q.is_expired(now=q.expires_at + 1)
+
+
+def test_a_quotes_totals_match_computing_them_directly():
+    lines = shoes_and_socks()
+    assert create_quote(lines).totals == compute_total(lines)
+
+
+def test_a_quote_carries_a_64_character_cart_hash():
+    q = create_quote(shoes_and_socks())
+    assert len(q.cart_hash) == 64
+    int(q.cart_hash, 16)
+
+
+def test_the_same_cart_produces_the_same_cart_hash_one_hundred_times():
+    """The determinism the Gate depends on: it re-derives this hash from its
+    own records and compares it against the one the buyer signed."""
+    lines = shoes_and_socks()
+    first = create_quote(lines).cart_hash
+    for _ in range(100):
+        assert create_quote(lines).cart_hash == first
+
+
+def test_request_order_does_not_change_the_cart_hash():
+    forward = resolve_lines([{"sku": "NW-SHOE-001", "qty": 1}, {"sku": "NW-SOCK-001", "qty": 2}])
+    reverse = resolve_lines([{"sku": "NW-SOCK-001", "qty": 2}, {"sku": "NW-SHOE-001", "qty": 1}])
+    assert create_quote(forward).cart_hash == create_quote(reverse).cart_hash
+
+
+def test_splitting_one_sku_across_two_lines_hashes_the_same_as_one_merged_line():
+    split = resolve_lines([{"sku": "NW-SOCK-001", "qty": 1}, {"sku": "NW-SOCK-001", "qty": 2}])
+    merged = resolve_lines([{"sku": "NW-SOCK-001", "qty": 3}])
+    assert create_quote(split).cart_hash == create_quote(merged).cart_hash
+
+
+def test_a_different_quantity_produces_a_different_cart_hash():
+    one = resolve_lines([{"sku": "NW-SOCK-001", "qty": 1}])
+    two = resolve_lines([{"sku": "NW-SOCK-001", "qty": 2}])
+    assert create_quote(one).cart_hash != create_quote(two).cart_hash
+
+
+def test_the_cart_hash_ignores_the_product_name():
+    """A marketing edit to a product's name must not invalidate a signed cart
+    mandate. Only sku, quantity and unit price bind the economics."""
+    a = LineItem(sku="X", name="Original Name", unit_paise=100, qty=1)
+    b = LineItem(sku="X", name="Renamed In Marketing", unit_paise=100, qty=1)
+    assert create_quote([a]).cart_hash == create_quote([b]).cart_hash
+
+
+def test_the_cart_hash_changes_when_the_unit_price_changes():
+    """Check (g) of the Gate depends on this: price drift after a quote was
+    issued has to be detectable."""
+    a = LineItem(sku="X", name="X", unit_paise=100, qty=1)
+    b = LineItem(sku="X", name="X", unit_paise=101, qty=1)
+    assert create_quote([a]).cart_hash != create_quote([b]).cart_hash
+
+
+def test_a_quote_names_this_merchant_and_currency():
+    q = create_quote(shoes_and_socks())
+    assert q.merchant_id == config.MERCHANT_ID
+    assert q.currency == config.CURRENCY
+
+
+def test_an_empty_cart_cannot_be_quoted():
+    with pytest.raises(ValueError):
+        create_quote([])
+
+
+def test_a_quote_is_immutable():
+    q = create_quote(shoes_and_socks())
+    with pytest.raises(Exception):
+        q.total_paise = 1
+
+
+def test_every_money_value_in_a_serialised_quote_is_an_int():
+    q = create_quote(shoes_and_socks())
+    d = q.as_dict()
+    for field in ("subtotal_paise", "shipping_paise", "taxable_paise", "gst_paise", "total_paise"):
+        assert type(d[field]) is int, f"{field} is not an int"
+    assert type(d["issued_at"]) is int and type(d["expires_at"]) is int
+
+
+def test_total_paise_is_reachable_directly_on_the_quote():
+    """The Gate compares this against the signed mandate's total_paise."""
+    lines = shoes_and_socks()
+    assert create_quote(lines).total_paise == compute_total(lines).total_paise
