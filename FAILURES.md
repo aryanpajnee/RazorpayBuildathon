@@ -51,3 +51,111 @@ mean your key can call it. Availability is per-account, and the list endpoint
 doesn't reflect that. Test the actual call.
 
 **Cost:** ~10 minutes, because it was caught at setup rather than mid-agent-loop.
+
+---
+
+## 2026-08-26 — A green test run that wasn't running my tests.
+
+**What broke.** `uv run pytest tests/test_quote.py` failed with
+`ModuleNotFoundError: No module named 'dotenv'` — a module that was definitely
+installed, in a venv `uv run python -c "import dotenv"` was perfectly happy with.
+The dev extras had never been synced, so `pytest` wasn't in the project venv at
+all. `uv run` fell through to a **system** pytest on `PATH`, which ran under a
+different interpreter that couldn't see the project's dependencies.
+
+**How I got out.** `uv sync --extra dev`. Ten seconds, once I stopped reading the
+import error as an import problem and started reading it as a *which interpreter
+is this* problem.
+
+**What I'd tell the next person.** `uv run <tool>` does not guarantee the tool
+came from your venv. If it isn't installed there, uv will happily run whatever
+is on `PATH` and the failure looks like a broken dependency rather than a
+missing one. The tell is that the error names a package you know you have.
+Worse than the ten minutes lost: a system pytest that happens to *work* gives
+you a green run against the wrong environment, and you trust it.
+
+**Cost:** ~10 minutes.
+
+---
+
+## 2026-08-26 — `TEMPERATURE = 0.0` is doing nothing.
+
+**What broke.** Nothing, visibly — which is why it is worth writing down.
+`config.py` sets `TEMPERATURE = 0.0` on the reasoning that deterministic
+selection matters more than creative phrasing. While verifying tool-calling
+against a real Gemini call, the API returned a warning: `gemini-3.6-flash` uses
+fixed sampling and **ignores the `temperature` parameter entirely**.
+
+**How I got out.** Nothing to fix — but the belief behind the setting was wrong,
+and an unexamined wrong belief on a demo path is a bug waiting for a bad moment.
+The setting stays for the other two providers; what changed is the claim. I can
+no longer say "the model is deterministic because temperature is zero." Agent
+output on Gemini is *not* reproducible run to run.
+
+**What I'd tell the next person.** This matters more here than in most projects,
+because the whole architecture rests on a line between deterministic code and
+non-deterministic models. If you claim determinism, claim it where it is
+actually true — the vault, the quote engine, the gate — and not for a model
+whose provider quietly ignores the knob you set.
+
+**Cost:** zero, because it surfaced in a warning I read rather than a demo I lost.
+
+---
+
+## 2026-08-26 — Two agents built the same vocabulary twice, and disagreed.
+
+**What broke.** I ran five subagents in parallel on file-disjoint work. Two of
+them wrote specs that had to interoperate: the ledger spec defined a **closed**
+list of audit event types (`gate.passed`, `gate.refused`, dotted lowercase), and
+the gate spec — written simultaneously, unable to see the other — independently
+invented `GATE_PASS` and `GATE_REFUSAL` for the same two events. Both documents
+were internally consistent and confidently written. Left alone I would have
+implemented `ledger.py` against one vocabulary and `gate.py` against the other
+and found out at integration, on a day with no slack in it.
+
+**How I got out.** Diffed the event names across the two specs before accepting
+either — `grep -oE` for the event-shaped tokens in each file, sorted, compared.
+The ledger owns that vocabulary because its list is the closed one, so the gate
+spec was the one that got rewritten, along with two references to test files
+that don't exist.
+
+**What I'd tell the next person.** File-disjoint is not the same as
+conflict-free. Two agents can respect every file boundary you set and still
+produce work that cannot be integrated, because the thing they collided on was a
+shared *concept*, not a shared file. If parallel work has to interoperate, one
+side has to own the shared vocabulary and the other has to be told to consume
+it — and you have to check, because both will sound certain.
+
+**Cost:** ~5 minutes to catch, because I looked. Would have been an afternoon in
+Phase 2 if I hadn't.
+
+---
+
+## 2026-08-26 — Idempotency that stops a second row, not a second order.
+
+**What broke.** Found in code review rather than at runtime, which is the only
+reason it is cheap. `merchant/gateway.py` makes order creation idempotent on
+`quote_id` with two layers: an in-process lock, and a `UNIQUE` constraint as the
+fallback. The constraint reliably guarantees **one row per quote_id**. It does
+not guarantee **one order per quote_id**.
+
+Two processes (two uvicorn workers, say) racing the same `quote_id` both pass
+the "not on file yet" check, both call Razorpay, and both get a real order back.
+Only one INSERT then wins; the loser returns the winner's row and discards its
+own. The discarded order still exists at Razorpay — orphaned, unreferenced, and
+invisible to the merchant's own records.
+
+**How I got out.** Not fixed, and deliberately so: closing it properly needs an
+INSERT-then-call ordering with a reservation row, which is a real change to the
+money path and not something to do the day before a demo. What I did instead was
+stop the code from lying about it — the comment used to defer to `FAILURES.md`,
+where no such entry existed. Now it does.
+
+**What I'd tell the next person.** A `UNIQUE` constraint makes your *database*
+idempotent. It does nothing about the side effect you already performed before
+reaching it. If the expensive, irreversible action happens before the constraint
+is tested, the constraint is deduplicating your records, not your actions —
+and with a payment gateway those are very different things.
+
+**Cost:** none yet. Single-process demo runs cannot hit it. Written down so it
+is a known limitation rather than a surprise.
