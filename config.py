@@ -22,6 +22,8 @@ LEDGER_DB = DATA_DIR / "ledger.db"
 ORDERS_DB = DATA_DIR / "orders.db"              # quote_id -> order_id, the idempotency record
 WEBHOOK_EVENTS_DB = DATA_DIR / "webhook_events.db"  # delivered webhook hashes, replay defence
 GATE_NONCES_DB = DATA_DIR / "gate_nonces.db"    # spent cart-mandate nonces, replay defence
+QUOTES_DB = DATA_DIR / "quotes.db"              # issued quotes, looked up by quote_id at gate time
+INTENTS_DB = DATA_DIR / "intents.db"            # granted+verified intents and their purchase counts
 
 # --- LLM -------------------------------------------------------------------
 # The buyer agent needs reliable tool-calling. A local 8B model emits malformed
@@ -30,18 +32,45 @@ GATE_NONCES_DB = DATA_DIR / "gate_nonces.db"    # spent cart-mandate nonces, rep
 # tool-calling properly. Flip LLM_PROVIDER in .env to switch.
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")
 
+# NVIDIA's NIM endpoint is OpenAI-compatible, reached through langchain-openai
+# with a custom base_url. Benchmarked live 26 Aug: the 8B is ~0.4s/call and
+# correct on prose + tool-calls, but it mis-scaled rupees->paise (returned 5000
+# where 500000 was required). So it is a FAST LANE FOR PROSE ONLY and must never
+# be routed a numeric or mandate-drafting task — see FAST_LLM_SURFACES below.
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.1-8b-instruct")
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+
 MODELS = {
     "gemini": "gemini-3.6-flash",      # free tier: 1500 req/day, 15 req/min, no card.
                                        # 2.5-flash is listed by the API but 404s for new keys.
+    "nvidia": NVIDIA_MODEL,            # fast lane for non-numeric surfaces only
     "anthropic": "claude-sonnet-5",
     "openai": "gpt-4o",
 }
 CHAT_MODEL = MODELS[LLM_PROVIDER]
 
+# --- provider routing ------------------------------------------------------
+# Gemini 3.6 Flash is the default for everything numeric or judgment-critical:
+# drafting a mandate's max_paise, budget allocation, evaluating price-vs-fit,
+# negotiation numbers. The NVIDIA 8B fast lane takes only surfaces that emit
+# pure prose (no number the buyer or merchant relies on), where its speed wins
+# and a miscounted paise value is structurally impossible because it never
+# produces one. The router keys off the `purpose` string each surface passes to
+# llm.invoke(); anything NOT in this set stays on the default provider.
+FAST_LLM_PROVIDER = "nvidia"
+FAST_LLM_SURFACES = frozenset({
+    "storefront",          # #1 conversational front door
+    "refusal_explainer",   # #6 gate code+detail -> plain English (echoes numbers, computes none)
+    "substitution",        # #5 out-of-stock -> alternatives (semantic match, no arithmetic)
+    "auditor",             # #16 ledger -> plain-English incident narration
+    "injector",            # #14 red team: writes poisoned product copy
+})
+
 # Deterministic selection matters more than creative phrasing here.
 TEMPERATURE = 0.0
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 

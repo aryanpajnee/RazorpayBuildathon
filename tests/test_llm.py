@@ -9,6 +9,7 @@ this file sleeps for real, so the whole suite runs in well under a second.
 from __future__ import annotations
 
 import langchain_google_genai
+import langchain_openai
 import pytest
 
 import config
@@ -23,6 +24,7 @@ from buyer.llm import (
     UnknownProviderError,
     default_rate_guard,
     get_chat_model,
+    provider_for_purpose,
 )
 
 
@@ -408,3 +410,90 @@ def test_gateway_exposes_the_rate_guard_state():
     gateway.invoke([], purpose="negotiator")
 
     assert gateway.rate_guard_state.requests_this_minute == 1
+
+
+# --- NVIDIA fast lane + per-purpose routing -------------------------------------------
+
+
+def test_nvidia_provider_is_constructed_with_base_url_and_key(monkeypatch):
+    monkeypatch.setattr(config, "NVIDIA_API_KEY", "fake-nvidia-key")
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", FakeChatOpenAI)
+
+    get_chat_model(provider="nvidia")
+
+    assert captured["model"] == config.MODELS["nvidia"]
+    assert captured["api_key"] == "fake-nvidia-key"
+    assert captured["base_url"] == config.NVIDIA_BASE_URL
+    assert captured["temperature"] == config.TEMPERATURE
+
+
+def test_missing_nvidia_api_key_raises_at_construction(monkeypatch):
+    monkeypatch.setattr(config, "NVIDIA_API_KEY", "")
+
+    with pytest.raises(MissingAPIKeyError) as exc_info:
+        get_chat_model(provider="nvidia")
+
+    assert "NVIDIA_API_KEY" in str(exc_info.value)
+
+
+def test_unknown_provider_error_now_names_nvidia_too():
+    with pytest.raises(UnknownProviderError) as exc_info:
+        get_chat_model(provider="watson")
+    assert "nvidia" in str(exc_info.value)
+
+
+def test_prose_surfaces_route_to_the_nvidia_fast_lane(monkeypatch):
+    monkeypatch.setattr(config, "NVIDIA_API_KEY", "present")
+    for purpose in config.FAST_LLM_SURFACES:
+        assert provider_for_purpose(purpose) == "nvidia"
+
+
+def test_numeric_and_unknown_surfaces_stay_on_the_default_provider(monkeypatch):
+    monkeypatch.setattr(config, "NVIDIA_API_KEY", "present")
+    monkeypatch.setattr(config, "LLM_PROVIDER", "gemini")
+    # intent_compiler drafts paise; negotiator/planner reason over numbers.
+    for purpose in ("intent_compiler", "buyer_planner", "negotiator", "evaluator"):
+        assert provider_for_purpose(purpose) == "gemini"
+
+
+def test_fast_surface_falls_back_to_default_when_no_nvidia_key(monkeypatch):
+    monkeypatch.setattr(config, "NVIDIA_API_KEY", "")
+    monkeypatch.setattr(config, "LLM_PROVIDER", "gemini")
+    # a prose surface must not hard-fail just because NVIDIA isn't configured
+    assert provider_for_purpose("storefront") == "gemini"
+
+
+def test_gateway_routes_each_purpose_to_the_right_provider_model(monkeypatch):
+    """With no explicit model injected, the gateway builds one model per
+    provider (lazily) and sends each purpose to the correct one."""
+    monkeypatch.setattr(config, "NVIDIA_API_KEY", "present")
+    monkeypatch.setattr(config, "LLM_PROVIDER", "gemini")
+
+    built = []
+
+    def fake_get_chat_model(*, provider):
+        built.append(provider)
+        m = FakeModel(["ok"])
+        m.provider = provider
+        return m
+
+    monkeypatch.setattr("buyer.llm.get_chat_model", fake_get_chat_model)
+
+    guard, _ = make_guard()
+    gateway = LLMGateway(guard=guard, sleep_fn=FakeClock().sleep)  # no explicit model
+
+    # a numeric surface -> gemini; a prose surface -> nvidia
+    m_numeric = gateway._model_for("intent_compiler")
+    m_prose = gateway._model_for("storefront")
+
+    assert m_numeric.provider == "gemini"
+    assert m_prose.provider == "nvidia"
+    # each provider built exactly once, then cached
+    gateway._model_for("intent_compiler")
+    assert built.count("gemini") == 1 and built.count("nvidia") == 1

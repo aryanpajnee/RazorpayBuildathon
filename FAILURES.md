@@ -159,3 +159,82 @@ and with a payment gateway those are very different things.
 
 **Cost:** none yet. Single-process demo runs cannot hit it. Written down so it
 is a known limitation rather than a surprise.
+
+---
+
+## 2026-08-26 — `INSERT OR REPLACE` reset a spend counter that a mandate depends on.
+
+**What broke.** Phase 2 (the ledger, the Gate, the merchant API) was built by
+six subagents running in parallel on file-disjoint slices. `merchant/intent_store.py`
+was one of those slices, and it used `INSERT OR REPLACE` to register an Intent
+Mandate by `mandate_id`. That statement doesn't merge a row, it overwrites the
+whole thing. The Gate enforces the user's `max_purchases` cap by reading a
+`purchases_used` counter stored on that same row, so re-registering an existing
+`mandate_id` silently reset the counter back to 0 — restoring a spent purchase
+cap out from under the Gate. The same overwrite would let a repeat `mandate_id`
+swap in a different stored payload too, including a raised `max_paise`. Nothing
+in Phase 2 exposes intent re-registration yet, so this wasn't reachable at
+runtime — but the buyer-side intent-grant path is exactly what Phase 4 adds, and
+I found this in a manager review pass over the six slices, not by hitting it.
+
+**How I got out.** Switched the statement to
+`INSERT ... ON CONFLICT(mandate_id) DO NOTHING`. An Intent Mandate is now
+immutable once granted: a repeat `mandate_id` is ignored outright, so both the
+original payload and the purchase counter survive untouched. This is correct,
+not lossy, because a genuine new grant always carries a fresh uuid `mandate_id`
+— there's no legitimate case where the same id should ever mean a different
+intent. Added a regression test that registers, spends twice, re-registers with
+the same `mandate_id`, and asserts the counter is still 2.
+
+**What I'd tell the next person.** `INSERT OR REPLACE` is a full-row overwrite
+dressed up as an upsert — fine for a cache where any field can go stale, unsafe
+the moment the row also holds security-relevant state like a spend counter,
+because "replace" doesn't know which columns are cache and which are ledger.
+And the parallel-agent lesson repeats: file-disjoint slices don't get you
+cross-cutting correctness for free. Each of the six files was locally
+reasonable on its own; this only surfaced because someone reviewed all six
+against each other afterward.
+
+**Cost:** caught in review, minutes to fix. Would have been a real
+authorization bypass if it had reached the Phase 4 intent-grant endpoint
+unnoticed.
+
+---
+
+## 2026-08-26 — Benchmarking NVIDIA's free tier against Gemini: fast or correct, not both.
+
+**What broke.** Nothing in the shipped code — this was a deliberate check
+before committing to Gemini as the only model, to see whether NVIDIA's free API
+tier was a better fit for the 17 agent surfaces. The axis that actually matters
+for this project is tool-calling plus correct number handling, because the
+intent-compiler drafts the `max_paise` value the user signs — a wrong number
+there is not a UX bug, it's a wrong mandate. I ran the same prompts against
+three models. Gemini `gemini-3.6-flash` went 3/3, median ~3s, correct tool
+call, and converted "at most ₹5000" to `500000` paise correctly. NVIDIA's
+high-quality model, `meta/llama-3.3-70b-instruct`, was also correct when it
+answered — but free-tier latency was a median of **37.7s**, with one of three
+calls eating the full 90s timeout. Unusable for a live demo firing many agent
+calls. NVIDIA's fast model, `meta/llama-3.1-8b-instruct`, was the opposite
+problem: **~0.4s** median, passed the tool call, but on the mandate-drafting
+task it returned `max_paise: 5000` where `500000` was required — it never
+scaled rupees to paise. A 100x money error, in the one task that feeds a signed
+mandate.
+
+**How I got out.** There wasn't a fix to make, just a decision to take: on
+NVIDIA's free tier the model fast enough to demo with is the one that miscounts
+money, and the model that gets the money right is too slow to demo with. Kept
+Gemini 3.6 Flash as the default for everything numeric or judgment-critical.
+Wired the NVIDIA 8B in only as a fast lane for surfaces that emit no number
+anyone relies on — storefront chat, refusal-explainer wording, substitution
+suggestions, the ledger auditor's narration, red-team injection copy — so its
+paise weakness is structurally out of reach rather than merely unlikely to
+trigger.
+
+**What I'd tell the next person.** Speed is worthless if the model is wrong on
+the one value the whole system exists to protect — test the number, not just
+whether the call comes back. And "free tier vs. free tier" isn't a vendor
+comparison, it's a which-hosted-model comparison; NVIDIA's own two free models
+disagreed with each other by two orders of magnitude and forty seconds.
+
+**Cost:** ~an hour of benchmarking. Net gain — the fast lane speeds up prose
+surfaces without ever touching the money path.

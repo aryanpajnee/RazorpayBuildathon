@@ -33,13 +33,14 @@ from dataclasses import dataclass
 
 import config
 
+_NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
 _OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 
 DEFAULT_MAX_ATTEMPTS = config.LLM_MAX_ATTEMPTS
 DEFAULT_BACKOFF_BASE_SECONDS = config.LLM_RETRY_BACKOFF_BASE_SECONDS
 
-_VALID_PROVIDERS = ("gemini", "anthropic", "openai")
+_VALID_PROVIDERS = ("gemini", "nvidia", "anthropic", "openai")
 
 _SECONDS_PER_MINUTE = 60.0
 _SECONDS_PER_DAY = 86400.0
@@ -288,6 +289,23 @@ def get_chat_model(**overrides):
             **overrides,
         )
 
+    if provider == "nvidia":
+        # NVIDIA's NIM endpoint speaks the OpenAI wire protocol, so the OpenAI
+        # client reaches it with a custom base_url. This is the fast lane for
+        # prose-only surfaces (see config.FAST_LLM_SURFACES); nothing numeric is
+        # ever routed here, so the 8B's paise-scaling weakness cannot bite.
+        if not config.NVIDIA_API_KEY:
+            raise MissingAPIKeyError("nvidia", _NVIDIA_API_KEY_ENV)
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=model_name,
+            api_key=config.NVIDIA_API_KEY,
+            base_url=config.NVIDIA_BASE_URL,
+            temperature=temperature,
+            **overrides,
+        )
+
     if provider == "anthropic":
         api_key = config.ANTHROPIC_API_KEY
         if not api_key:
@@ -307,6 +325,29 @@ def get_chat_model(**overrides):
     return ChatOpenAI(model=model_name, api_key=api_key, temperature=temperature, **overrides)
 
 
+# --- provider routing ---------------------------------------------------------------------
+
+
+def provider_for_purpose(purpose: str) -> str:
+    """Which provider a given agent surface routes to.
+
+    Fast, prose-only surfaces (`config.FAST_LLM_SURFACES`) take the NVIDIA fast
+    lane; everything else — anything numeric or judgment-critical — stays on the
+    default provider (`config.LLM_PROVIDER`, Gemini 3.6 Flash). The split is a
+    deliberate safety property, not just a speed tweak: the 8B mis-scales money
+    (it returned 5000 paise where 500000 was required in the 26 Aug bench), so
+    it only ever sees surfaces that emit no number anyone relies on.
+
+    If the fast lane is selected but no NVIDIA key is configured, fall back to
+    the default provider rather than failing a surface that has a good default.
+    """
+    if purpose in config.FAST_LLM_SURFACES:
+        if config.FAST_LLM_PROVIDER == "nvidia" and not config.NVIDIA_API_KEY:
+            return config.LLM_PROVIDER
+        return config.FAST_LLM_PROVIDER
+    return config.LLM_PROVIDER
+
+
 # --- the instrumented entry point --------------------------------------------------------
 
 
@@ -315,7 +356,13 @@ class LLMGateway:
 
     Wraps a chat model with the rate guard and retry-with-backoff, and counts
     calls per `purpose` (the name of the calling agent surface) so a metrics
-    agent can report where the shared Gemini quota went.
+    agent can report where the shared quota went.
+
+    Model selection: if an explicit `model` is injected, it is used for every
+    call (tests and single-provider callers rely on this). Otherwise the
+    gateway routes per `purpose` via `provider_for_purpose`, lazily building and
+    caching one chat model per provider — so a prose surface hits the NVIDIA
+    fast lane and a numeric surface hits Gemini, through the same one door.
     """
 
     def __init__(
@@ -329,12 +376,27 @@ class LLMGateway:
     ) -> None:
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
-        self._model = model if model is not None else get_chat_model()
+        # None means "route per purpose, lazily". An explicit model overrides
+        # routing entirely and is used for every call.
+        self._explicit_model = model
+        self._models_by_provider: dict[str, object] = {}
         self._guard = guard if guard is not None else default_rate_guard()
         self._max_attempts = max_attempts
         self._backoff_base_seconds = backoff_base_seconds
         self._sleep_fn = sleep_fn
         self._purpose_counts: Counter[str] = Counter()
+
+    def _model_for(self, purpose: str):
+        """The chat model this purpose should use. An injected model wins; else
+        route to a provider and lazily build+cache that provider's model."""
+        if self._explicit_model is not None:
+            return self._explicit_model
+        provider = provider_for_purpose(purpose)
+        model = self._models_by_provider.get(provider)
+        if model is None:
+            model = get_chat_model(provider=provider)
+            self._models_by_provider[provider] = model
+        return model
 
     def invoke(self, messages, *, purpose: str):
         """Call the underlying model, guarded and retried.
@@ -344,12 +406,13 @@ class LLMGateway:
         whole point of having one. A `DailyBudgetExceededError` from the
         guard is never retried; it propagates immediately.
         """
+        model = self._model_for(purpose)  # resolved once: retries stay on one provider
         last_error: BaseException | None = None
         for attempt in range(1, self._max_attempts + 1):
             self._guard.acquire()
             self._purpose_counts[purpose] += 1
             try:
-                return self._model.invoke(messages)
+                return model.invoke(messages)
             except DailyBudgetExceededError:
                 raise
             except Exception as exc:  # noqa: BLE001 - classified below
