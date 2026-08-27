@@ -1,8 +1,8 @@
 # Spec — `merchant/gate.py`
 
 **Not written this session.** This is the spec, not the implementation. It
-exists so that whoever writes `gate.py` — Aryan or Claude, now or in three
-weeks — is transcribing a decision that has already been made, not making it
+exists so that whoever writes `gate.py`, now or in three
+weeks, is transcribing a decision that has already been made, not making it
 under deadline pressure. Read the whole thing before typing a line.
 
 Read `docs/specs/mandate-spec.md` first if you haven't. This spec assumes you
@@ -506,12 +506,16 @@ touching money happens off the record.
   loudly is exactly what the ledger exists to prove happened; refusing to
   log it because the input wasn't trustworthy defeats the purpose.
 - The Gate's ledger responsibility ends at `gate.passed` / `gate.refused`.
-  Downstream events — `payment.succeeded`, `payment.failed`,
-  `webhook.received` — are appended by the payment
-  execution and webhook code, not by this file, and are chained onto the
-  same ledger by whatever hash-chaining mechanism `core/ledger.py` defines.
-  The Gate calls the append once per decision and moves on; it does not
-  read the chain back or verify it.
+  Downstream events — `order.created`, `payment.attempted`,
+  `webhook.received`, `payment.succeeded`, `payment.failed` — are appended by
+  the payment-execution and webhook code, not by this file. In particular the
+  Gate never emits `payment.attempted` or `order.created`: it does not talk to
+  Razorpay (§1), so it is never the code that attempts a payment or creates an
+  order, and `payment.attempted` carrying a `razorpay_order_id` can only be
+  written *after* `order.created`, downstream of a `gate.passed`. These events
+  are chained onto the same ledger by whatever hash-chaining mechanism
+  `core/ledger.py` defines. The Gate calls the append once per decision and
+  moves on; it does not read the chain back or verify it.
 
 ---
 

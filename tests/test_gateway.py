@@ -9,6 +9,8 @@ the network.
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -50,36 +52,31 @@ def test_a_gateway_response_confirming_a_different_amount_than_requested_raises(
         create_order("quote_divergent", 100000, gateway=_DivergentAmountGateway(), db_path=db)
 
 
-class _RacingGateway:
-    """Simulates a second process winning the race: by the time this
-    gateway's own INSERT would run, a competing row for the same quote_id is
-    already committed. Used to exercise the UNIQUE-constraint fallback
-    deterministically, without real threads or timing.
+class _SlowGateway:
+    """A gateway double that sleeps briefly before responding, so a real
+    `threading` race between two callers for the *same* quote_id has a
+    window in which the second caller can observe the first's reservation
+    while it is still in flight. Used to prove the reservation-first design
+    actually excludes a second gateway call, rather than relying on timing
+    getting lucky.
     """
 
-    def __init__(self, db_path, winner_order_id):
-        self._db_path = db_path
-        self._winner_order_id = winner_order_id
+    def __init__(self, delay_seconds: float = 0.08) -> None:
+        self.calls = 0
+        self._lock = threading.Lock()
+        self._delay_seconds = delay_seconds
 
     def create_order(self, amount_paise, currency, receipt, notes):
-        # Plant the "other process's" row directly, bypassing create_order().
-        conn = sqlite3.connect(self._db_path)
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS orders ("
-            "quote_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, "
-            "amount_paise INTEGER NOT NULL, currency TEXT NOT NULL, "
-            "status TEXT NOT NULL, created_at TEXT NOT NULL)"
-        )
-        conn.execute(
-            "INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?)",
-            (receipt, self._winner_order_id, amount_paise, currency, "created", "2026-01-01T00:00:00+00:00"),
-        )
-        conn.commit()
-        conn.close()
-        # This gateway's own order still "succeeds" from Razorpay's point of
-        # view -- a real cross-process race can't stop the network call that
-        # already left, it can only stop us from recording it as canonical.
-        return {"id": "order_loser000001", "amount": amount_paise, "currency": currency, "status": "created"}
+        with self._lock:
+            self.calls += 1
+            call_number = self.calls
+        time.sleep(self._delay_seconds)
+        return {
+            "id": f"order_slow{call_number:06d}",
+            "amount": amount_paise,
+            "currency": currency,
+            "status": "created",
+        }
 
 
 # --- idempotency -------------------------------------------------------------
@@ -138,20 +135,52 @@ def test_an_integrity_error_that_is_not_a_quote_id_collision_raises_a_named_erro
         create_order("quote_phantom", 100000, gateway=_PhantomIntegrityErrorGateway(), db_path=db)
 
 
-def test_a_lost_race_returns_the_winning_orders_id_and_leaves_one_row(tmp_path):
-    """Two processes both pass the 'not on file yet' check and both call the
-    gateway; only one of their INSERTs can win the UNIQUE constraint. The
-    loser must surface the winner's order, not its own."""
+def test_reservation_first_closes_the_cross_process_double_call_race(tmp_path):
+    """Regression test for FAILURES.md's "Idempotency that stops a second
+    row, not a second order": two callers race the *same* quote_id,
+    released together via a Barrier, against a gateway that sleeps briefly
+    before answering -- simulating the window in which a second process
+    could, under the old check-then-act design, also pass the "not on file
+    yet" check and also call Razorpay.
+
+    Under reservation-first ordering only one of the two callers should ever
+    reach the gateway at all: the other must find the reservation already
+    claimed and wait for it, not call the gateway a second time.
+    """
     db = tmp_path / "orders.db"
-    gw = _RacingGateway(db, winner_order_id="order_winner000001")
-    result = create_order("quote_race", 250000, gateway=gw, db_path=db)
-    assert result.order_id == "order_winner000001"
-    assert result.from_cache is True
+    gw = _SlowGateway(delay_seconds=0.08)
+    barrier = threading.Barrier(2)
+    results: list[Order] = []
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=5)
+            order = create_order("quote_concurrent", 750000, gateway=gw, db_path=db)
+            results.append(order)
+        except BaseException as exc:  # noqa: BLE001 - captured for the main thread to re-raise
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, f"worker thread(s) raised: {errors}"
+    assert len(results) == 2
+    assert gw.calls == 1, "the gateway must be called exactly once for a raced quote_id"
+    assert results[0].order_id == results[1].order_id
+    assert {r.from_cache for r in results} == {True, False}, (
+        "exactly one caller creates (from_cache=False), the other is served the cache"
+    )
 
     conn = sqlite3.connect(db)
-    rows = conn.execute("SELECT order_id FROM orders WHERE quote_id = 'quote_race'").fetchall()
+    rows = conn.execute(
+        "SELECT order_id, status FROM orders WHERE quote_id = 'quote_concurrent'"
+    ).fetchall()
     conn.close()
-    assert rows == [("order_winner000001",)], "exactly one row must survive the race"
+    assert rows == [(results[0].order_id, "created")], "exactly one row must survive the race"
 
 
 # --- amount validation ---------------------------------------------------
@@ -231,6 +260,28 @@ def test_order_is_a_frozen_dataclass(tmp_path):
 def test_find_by_order_id_returns_none_for_an_unknown_order(tmp_path):
     db = tmp_path / "orders.db"
     assert find_by_order_id("order_does_not_exist", db_path=db) is None
+
+
+def test_find_by_order_id_never_returns_a_bare_pending_reservation(tmp_path):
+    """A pending (or reclaiming) reservation has order_id IS NULL -- it must
+    never be surfaced by find_by_order_id, which webhooks.py relies on to
+    resolve only real, gateway-confirmed orders."""
+    db = tmp_path / "orders.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS orders ("
+        "quote_id TEXT PRIMARY KEY, order_id TEXT, "
+        "amount_paise INTEGER NOT NULL, currency TEXT NOT NULL, "
+        "status TEXT NOT NULL, created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO orders (quote_id, order_id, amount_paise, currency, status, created_at) "
+        "VALUES ('quote_pending_only', NULL, 100000, 'INR', 'pending', '2026-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    assert find_by_order_id("order_never_assigned", db_path=db) is None
 
 
 def test_find_by_order_id_recovers_the_quote_id(tmp_path):

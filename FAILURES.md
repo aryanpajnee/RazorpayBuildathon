@@ -134,31 +134,66 @@ Phase 2 if I hadn't.
 ## 2026-08-26 — Idempotency that stops a second row, not a second order.
 
 **What broke.** Found in code review rather than at runtime, which is the only
-reason it is cheap. `merchant/gateway.py` makes order creation idempotent on
+reason it is cheap. `merchant/gateway.py` made order creation idempotent on
 `quote_id` with two layers: an in-process lock, and a `UNIQUE` constraint as the
-fallback. The constraint reliably guarantees **one row per quote_id**. It does
+fallback. The constraint reliably guaranteed **one row per quote_id**. It did
 not guarantee **one order per quote_id**.
 
-Two processes (two uvicorn workers, say) racing the same `quote_id` both pass
-the "not on file yet" check, both call Razorpay, and both get a real order back.
-Only one INSERT then wins; the loser returns the winner's row and discards its
-own. The discarded order still exists at Razorpay — orphaned, unreferenced, and
-invisible to the merchant's own records.
+Two processes (two uvicorn workers, say) racing the same `quote_id` both passed
+the "not on file yet" check, both called Razorpay, and both got a real order
+back. Only one INSERT then won; the loser returned the winner's row and
+discarded its own. The discarded order still existed at Razorpay — orphaned,
+unreferenced, and invisible to the merchant's own records.
 
-**How I got out.** Not fixed, and deliberately so: closing it properly needs an
-INSERT-then-call ordering with a reservation row, which is a real change to the
-money path and not something to do the day before a demo. What I did instead was
-stop the code from lying about it — the comment used to defer to `FAILURES.md`,
-where no such entry existed. Now it does.
+**How I got out (2026-08-27, actually fixed).** Rewrote `create_order()` around
+reservation-first ordering instead of call-then-record. The `orders` table's
+`order_id` column is now nullable and rows move through `pending` (claimed,
+gateway not yet called) → `created` (gateway confirmed, order_id on file), with
+a third `reclaiming` state for taking over an abandoned reservation. A caller
+first tries to INSERT a `pending` row for `quote_id` inside a `BEGIN IMMEDIATE`
+transaction — SQLite's IMMEDIATE lock, not the old Python-level
+`threading.Lock`, is what actually excludes a second writer, and it does so
+across processes as well as threads, because it is enforced by the database
+file itself. Only the caller whose INSERT lands may call the gateway. A caller
+that loses the claim never calls the gateway: if the row is already `created`
+it returns that order (`from_cache=True`); if it is still `pending` it polls,
+without holding any lock while waiting, for the owner to finish. A gateway
+failure (exception, an unconfirmed amount, or a garbage order id) deletes the
+reservation so a retry claims a clean slate — preserving the original
+`OrderCreationError` promise that "a failed attempt leaves no row behind to
+collide with."
+
+**What's actually closed.** The exact scenario above — two live callers racing
+the same `quote_id`, both reaching Razorpay — is now excluded by construction,
+not just observed and reported. Proven with a real `threading` regression test
+(`test_reservation_first_closes_the_cross_process_double_call_race` in
+`tests/test_gateway.py`): two threads released together via a `Barrier` against
+a gateway that sleeps before answering, asserting the gateway is called exactly
+once and both callers get the same `order_id`.
+
+**What's still open — narrower, but honest.** If a caller's process dies
+*after* the gateway confirms an order but *before* the finalizing `UPDATE`
+commits, its reservation is left `pending` (or `reclaiming`) forever. A later
+caller for the same `quote_id`, after waiting out a timeout, will reclaim that
+abandoned reservation and call the gateway again, creating a second real order.
+This needs two independent failures — a crash landing in that exact
+few-millisecond gap between "gateway answered" and "row written" — rather than
+ordinary concurrency, and a single-process demo cannot hit it. It is not
+claimed to be closed; a real fix needs either a durable outbox/reconciliation
+step against Razorpay's own order-by-receipt lookup, or idempotency support on
+the gateway's side, and that is out of scope for this pass.
 
 **What I'd tell the next person.** A `UNIQUE` constraint makes your *database*
 idempotent. It does nothing about the side effect you already performed before
-reaching it. If the expensive, irreversible action happens before the constraint
-is tested, the constraint is deduplicating your records, not your actions —
-and with a payment gateway those are very different things.
+reaching it. If the expensive, irreversible action happens before the
+ownership of the attempt is settled, the constraint is deduplicating your
+records, not your actions — and with a payment gateway those are very
+different things. Settling ownership *before* the side effect (reserve, then
+call) is what actually closes the race; the constraint is only ever a backstop
+for whatever the reservation step itself failed to prevent.
 
-**Cost:** none yet. Single-process demo runs cannot hit it. Written down so it
-is a known limitation rather than a surprise.
+**Cost:** none. Caught in code review before the original fallback shipped to
+a demo, and closed before the live-money-path work in Phase 3.
 
 ---
 
@@ -238,3 +273,114 @@ disagreed with each other by two orders of magnitude and forty seconds.
 
 **Cost:** ~an hour of benchmarking. Net gain — the fast lane speeds up prose
 surfaces without ever touching the money path.
+
+---
+
+## 2026-08-27 — The live run works; the test card is "international" and blocked.
+
+**What broke.** First real end-to-end run against test-mode Razorpay. The
+autonomous half was flawless: intent granted, quoted (₹5,898.82), Cart Mandate
+signed, Gate passed, and a real order (`order_TUZLFFTIF2U0Th`) created via the
+Orders API. Opened the checkout page, entered the canonical Razorpay test card
+`4111 1111 1111 1111` — and got *"Payment could not be completed. International
+cards are not supported."* Retried three times: three real `payment.failed`
+webhooks, no capture.
+
+**How I got out.** Two facts. First, this was never a bug in our code — the
+order, the checkout page and the webhook receiver all worked; the three failed
+attempts each produced a real, HMAC-verified `payment.failed` in the ledger, so
+the webhook round-trip proved itself on live Razorpay events *before* a single
+success. Second, the block is account config, not the card: Razorpay classifies
+a test card's country by its BIN, and an Indian test account has international
+payments off by default, so `4111…` (which Razorpay's own docs also list as
+"domestic") gets rejected on this account. Switched to the **UPI test VPA
+`success@razorpay`**, which is unambiguously domestic and is Razorpay's canonical
+test-mode success path; a domestic Mastercard `5104 0155 5555 5558` also clears it.
+
+**What I'd tell the next person.** Don't reach for the famous `4111` Visa on a
+Razorpay test account — its country classification is per-account and will
+sometimes trip the international block with no warning until checkout. Use
+`success@razorpay` UPI for a reliable domestic test success and `failure@razorpay`
+to exercise the failure path on purpose. And a failed payment is not a failed
+integration: ours logged three real `payment.failed` events with genuine
+`event_id`s, which is exactly the webhook round-trip the money path needed to prove.
+
+**Cost:** minutes, once the error was read as account config rather than code.
+
+---
+
+## 2026-08-27 — The reservation-first rewrite needs a fresh orders.db.
+
+**What broke.** After rewriting `create_order()` to reserve `quote_id` *before*
+calling the gateway, `order_id` became nullable (a `pending` reservation has no
+order id yet). But a `data/orders.db` left over from before the rewrite still
+had the old `order_id TEXT NOT NULL` schema, and `CREATE TABLE IF NOT EXISTS`
+does not alter an existing table — so the first `pending` INSERT (order_id NULL)
+would hit a NOT NULL violation and surface as `UnexpectedIntegrityError`.
+
+**How I got out.** `data/*.db` is gitignored, regenerable operational state, so
+the fix is to move the stale db aside and let the new schema be created fresh.
+No migration script — this store holds no history worth preserving (the audit
+history lives in the ledger, which is a separate append-only store this never
+touches), so recreating it is correct, not lossy.
+
+**What I'd tell the next person.** `CREATE TABLE IF NOT EXISTS` silently keeps an
+old schema. When a column's constraints change, that guard becomes a trap: new
+code runs against an old shape and fails at the first write the new schema would
+have allowed. For a throwaway operational store, delete and recreate; for
+anything with history you'd need a real migration — which is exactly why the
+ledger is kept separate, append-only, and out of this path.
+
+**Cost:** caught on the first dry run, before the live run.
+
+---
+
+## 2026-08-27 — The first real capture, and one payment written to the ledger twice.
+
+**What broke.** Two things, on the run that finally produced a successful
+capture. First, the planned success path (UPI `success@razorpay`) didn't exist:
+the account's checkout preferences endpoint returns `upi: False` — UPI is
+disabled on this test account and, with the account unactivated, isn't a toggle
+we could flip. The prior entry's "switched to UPI" resolution never actually
+happened; **netbanking** was the real success path (any test bank → "Success"
+on the simulated page → auto-captured). Second, once the capture landed, the
+ledger held **two** `payment.succeeded` rows for the single payment
+(`pay_TUaYZKpLh3vEIg`, seq 12 and seq 14). Razorpay announces one successful
+payment with two distinct events — `payment.captured` *and* `order.paid`. Both
+carry different bytes, so `webhooks.py` (which dedupes on the SHA-256 of the raw
+body) correctly treats each as a genuine first delivery, and `api.py`'s
+money-outcome branch — guarded only by that byte-level `replay` flag — appended a
+success row for each. No double *charge* (one order, one payment id, order
+marked `paid` once), but the audit log double-counted the win, which for a
+project whose whole thesis is "a failed transaction never produces a second
+payment or order" is exactly the wrong place to be loose.
+
+**How I got out.** Added a second dedupe layer at the point that matters: before
+appending `payment.succeeded`, scan the ledger for an existing success with the
+same `razorpay_payment_id` and skip if present (`_success_already_logged` in
+`api.py`). The dedupe key is the payment's money-truth identity, not the bytes
+of whichever event announced it — so one captured payment maps to exactly one
+success row no matter how many events describe it. `payment.failed` needs no
+such guard: only one event type maps to "failed" and each failed attempt has its
+own payment id. Pinned with a test (`test_captured_then_order_paid_logs_one_success`)
+that fires both events for one payment and asserts a single success row; suite
+252 green. Also made auto-capture explicit (`payment_capture: 1` in
+`gateway.create_order`) so the terminal event is always `payment.captured` and
+never a silent `payment.authorized` at the mercy of the account default —
+though note the capture that exposed all this happened on an order created
+*before* that change, which means the account default was already auto-capture;
+the flag is correctness insurance, not the thing that fixed this run.
+
+**What I'd tell the next person.** "Not a byte-identical replay" is a weaker
+guarantee than "not the same event." Idempotency keyed on the raw-body hash
+stops redeliveries but not two *different* provider events about one underlying
+fact — and payment providers routinely fire several (`payment.captured`,
+`order.paid`, sometimes more) for a single success. Dedupe money outcomes on the
+provider's stable payment identifier, not on the delivery. The current guard is
+a read-then-write ledger scan that's only safe because `/webhook` is
+single-writer (no `await` between the scan and the append, one uvicorn worker);
+a multi-process deployment would have to enforce this in the store, not in
+application code.
+
+**Cost:** ~an hour, most of it understanding that captured and order.paid are
+two events for one payment rather than a bug in the dedupe that already existed.

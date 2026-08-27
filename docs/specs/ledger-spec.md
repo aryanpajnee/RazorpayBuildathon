@@ -190,11 +190,22 @@ Ten types, derived directly from the canonical flow, dotted and lowercase:
 | `mandate.rejected` | `core.mandate.verify`, on failure | `mandate_id` (if parseable), `reason` |
 | `gate.passed` | `merchant/gate.py`, all checks passed | `quote_id`, `cart_mandate_id`, `total_paise` |
 | `gate.refused` | `merchant/gate.py`, any check failed | `quote_id`, `reason`, `detail` |
-| `payment.attempted` | Gate, just before calling Razorpay | `quote_id`, `razorpay_order_id` |
-| `payment.succeeded` | webhook handler or sync response | `quote_id`, `razorpay_payment_id`, `amount_paise` |
-| `payment.failed` | webhook handler or sync response | `quote_id`, `razorpay_payment_id`, `reason` |
+| `order.created` | payment executor (`merchant/gateway.py` wiring), right after Razorpay `order.create` returns — **before** any payment; a Razorpay order precedes its payment | `order_id`, `quote_id`, `total_paise` |
+| `payment.attempted` | payment executor, when the created order is submitted for payment — **never the Gate**, which does not talk to Razorpay | `quote_id`, `razorpay_order_id` |
 | `webhook.received` | webhook endpoint, before processing | `event_id`, `razorpay_event_type` |
-| `order.created` | order-creation step, after payment succeeds | `order_id`, `quote_id`, `total_paise` |
+| `payment.succeeded` | webhook handler, on `payment.captured` / `order.paid` | `quote_id`, `razorpay_payment_id`, `amount_paise` |
+| `payment.failed` | webhook handler, on `payment.failed` | `quote_id`, `razorpay_payment_id`, `reason` |
+
+**Money-path ordering.** The five rows from `order.created` down are in true
+Razorpay lifecycle order, not guesswork: the merchant creates the order
+(`order.created`) *before* any payment exists, submits it (`payment.attempted`),
+then the gateway confirms asynchronously by webhook (`webhook.received` →
+`payment.succeeded` / `payment.failed`). `order.created` is emphatically **not**
+"after payment succeeds" — Razorpay's Orders API is order-first, payment-second
+(`gateway.create_order` returns `status: "created"` with no payment attached).
+All five are emitted by the Phase 3 payment-execution and webhook code, never by
+`gate.py` — the Gate returns pass/refuse and never calls Razorpay, so it cannot
+be the thing that "attempts a payment" or "creates an order."
 
 **Why `mandate.verified`/`mandate.rejected` are separate from
 `gate.passed`/`gate.refused`.** These are two different questions with two
