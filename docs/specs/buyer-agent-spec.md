@@ -1,5 +1,18 @@
 # Spec — `buyer/agent.py`
 
+> **STATUS: IMPLEMENTED (Phase 4, 27 Aug).** `buyer/agent.py` is built to this
+> spec and proven live. Deviations, all deliberate and documented: (1) #11
+> Negotiator and #12 Recovery are deterministic stubs, not LLM nodes yet — COMMIT
+> accepts the quote as-is (`negotiation_turns` stays 0) and RECOVER is a
+> deterministic §6 table in the file; both become LLM agents in Phase 5 by
+> swapping only the decision point, not the machine. (2) The per-phase §8 budget
+> is enforced as a whole-run cumulative ceiling scaled by `(LOCAL_RETRY_CAP+1)`,
+> because the raw budget of 1 would block the very retry §7 mandates. (3) Two
+> integration realities the spec predates: node returns are read through
+> `nodes_common.message_text()` (real Gemini `.content` is a list of blocks), and
+> the intent category is constrained to `config.CATALOG_CATEGORIES` (the Gate
+> compares it exactly against the product category).
+
 **Phase 4. You write this file.** This spec settles the state machine's shape,
 every transition, every bounded counter and the signing boundary in advance —
 writing the file is transcription and wiring, not design-while-typing.

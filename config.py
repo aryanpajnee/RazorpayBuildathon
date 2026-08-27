@@ -103,6 +103,15 @@ MERCHANT_BASE_URL = f"http://{MERCHANT_HOST}:{MERCHANT_PORT}"
 
 CURRENCY = "INR"
 
+# The merchant's controlled category vocabulary. An Intent Mandate's category
+# must be one the merchant recognises: the Gate refuses CATEGORY_MISMATCH on an
+# exact-string mismatch between the intent's category and the quoted product's
+# category. So the Intent Compiler (buyer/intent_compiler.py) constrains the
+# user's natural phrase ("running shoes") to one of these ("footwear") before
+# it is ever signed. This stands in for a real merchant publishing its taxonomy;
+# it must stay in step with the categories in data/catalog.json.
+CATALOG_CATEGORIES = ("footwear", "socks", "apparel", "accessories", "nutrition", "recovery", "bundle")
+
 # GST as integer basis points, not 0.18. A float rate is how a float gets into
 # a paise amount: total * 0.18 returns a float no matter how careful the caller
 # is. Basis points keep the whole computation in ints.
@@ -122,3 +131,23 @@ QUOTE_TTL_SECONDS = 90
 # touch a monetary value: 0.1 + 0.2 != 0.3 is not a bug you want inside a
 # payment authorization check.
 PAISE_PER_RUPEE = 100
+
+# --- Buyer agent (Phase 4) ---------------------------------------------------
+# The state machine (buyer/agent.py) and its LLM "node" surfaces (planner,
+# discovery, evaluator, intent_compiler, ...) share these caps so a stuck
+# negotiation or a chain of malformed model outputs fails loudly and on a
+# fixed budget instead of looping the demo into the ground or burning the
+# shared Gemini quota.
+ATTEMPT_CAP = 3            # max checkout attempts (1 initial + 2 recoveries) before ABANDONED
+NEGOTIATION_TURN_CAP = 4   # per-COMMIT negotiation turns before NEGOTIATION_STALEMATE
+LOCAL_RETRY_CAP = 1        # per-node retry on malformed model output before phase-level failure
+BUYER_AGENT_KEY_NAME = "buyer_agent"   # Ed25519 key that signs Cart Mandates
+USER_KEY_NAME = "user"                 # Ed25519 key the user signs Intent Mandates with
+
+# How long the agent will poll GET /ledger for a payment.succeeded/failed
+# entry after the Gate hands back an order_id, before giving up with
+# PaymentConfirmationTimeout. The one human step (opening the pay URL and
+# actually paying) can take a while — this is generous on purpose, and a
+# timeout here is deliberately NOT a terminal state: it means the human
+# simply hasn't paid yet, not that anything failed.
+PAYMENT_CONFIRM_TIMEOUT_SECONDS = 180

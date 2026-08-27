@@ -13,6 +13,6 @@ razorpay_test_api_keys*.csv
 *_api_keys*.csv
 secrets/
 
-# Local working instructions for Claude Code - not for the public repo
+# Local working instructions and build plan - not for the public repo
 CLAUDE.md
 plan.md

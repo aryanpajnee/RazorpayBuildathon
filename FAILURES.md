@@ -384,3 +384,78 @@ application code.
 
 **Cost:** ~an hour, most of it understanding that captured and order.paid are
 two events for one payment rather than a bug in the dedupe that already existed.
+
+## 2026-08-27 — The buyer agent's mocked tests all passed. The real model returned a list.
+
+**What broke.** Phase 4's four LLM node modules (planner, discovery, evaluator,
+intent_compiler) and the state machine (`buyer/agent.py`) were built with
+hermetic tests — every `llm.invoke` mocked, `.content` a plain JSON string. 60+
+tests green, a full suite of 310. Then the first live run against real
+`gemini-3.6-flash` died on the very first call: `intent_compiler.draft_intent`
+raised `NodeError: expected a string model response, got list`. A real Gemini
+response returns `.content` as a **list of content blocks**
+(`[{"type": "text", "text": "..."}]`), not a bare string. The mocks returned a
+string because that is the obvious shape to fake — so they hid the one thing
+only a live call could show. Every node would have failed identically in
+production; the test suite could not see it.
+
+**How I got out.** Added `nodes_common.message_text()` to coalesce a message's
+`.content` — bare string, list of strings, or list of `{"text": ...}` blocks —
+into plain text, and routed all four nodes through it before `extract_json`.
+Pinned it with a `FakeBlockMsg` test that carries the real list-of-blocks shape,
+and an end-to-end node test that a list-content response parses rather than
+raising. The live run got further.
+
+**Then two more the mocks couldn't surface, in the same session:**
+
+- **The evaluator's "nothing fits" was a dead branch.** `agent.py`'s
+  `_validate_selected` rejected an empty list as a *malformed shape*, so an
+  evaluator returning `[]` (its documented no-fit signal) became a
+  `NodeError → FAILED` instead of `RECOVER(NO_FIT)`. The entire NO_FIT recovery
+  path in spec §2/§6 was unreachable and untested. A new test for the
+  rate-limit path tripped over it. Fix: emptiness is a presence judgment the
+  caller makes, not a shape violation — `_validate_selected` now returns `[]`,
+  and EVALUATE turns it into NO_FIT. (The signing side still can never be handed
+  an empty cart: EVALUATE only advances to COMMIT on a non-empty selection.)
+
+- **The intent category didn't speak the merchant's language.** With the
+  list-content bug fixed, a real "running shoes under ₹5000" run got a clean
+  intent whose category was the natural phrase `"running shoes"`. The Gate
+  compares `product["category"] != intent["category"]` **exactly**, and the
+  catalog's category is `"footwear"`, so every shoe request was refused
+  `CATEGORY_MISMATCH` — the LLM happy path could never complete. The agent
+  *handled* it correctly (clean ABANDONED with a precise reason), which is why
+  nothing crashed; it just could never succeed. Fix: a controlled vocabulary in
+  `config.CATALOG_CATEGORIES`, and `intent_compiler` now constrains the model to
+  emit one of those and maps it to the canonical spelling the Gate compares
+  against ("running shoes" → "footwear") before anything is signed.
+
+- **A payment retry could read a stale failure as the verdict.**
+  `default_confirm_payment` early-returned on the first `payment.succeeded/failed`
+  it found for a `quote_id`. Since a PAYMENT_FAILED retry reuses the same
+  `quote_id`, an earlier attempt's `payment.failed` row would resolve a later
+  success as "failed". The order idempotency key guarantees ≤1 capture per
+  `quote_id`, so a `payment.succeeded` is terminal truth: the scan now reads the
+  whole ledger and lets succeeded win over failed.
+
+**What proved it all works.** With those four fixed, one typed sentence
+("buy me one pair of running shoes, up to ₹9000") ran fully autonomously through
+real Gemini (intent draft → plan → discover → evaluate) to a real Gate PASS and
+a **real Razorpay test-mode order** (`order_TUdVWPai5hFMta`, `payment.attempted`
+in the ledger) — the only remaining human step being the payment itself. And the
+thesis got its cleanest live demo for free: a "budget ₹5000" run picked a ₹4,999
+shoe the buyer thought fit, but the merchant's real total with 18% GST was
+₹5,898, so the **Gate refused OVER_LIMIT** and the agent abandoned. The buyer
+never computed the total; the merchant did, and said no.
+
+**What I'd tell the next person.** A mock encodes what you *think* the boundary
+looks like; a live call tells you what it *is*. Three of these four bugs were
+invisible to 310 green tests and took one real request each to expose — the
+response content shape, the category taxonomy coupling, and (via a new test) a
+whole dead recovery branch. Run the real thing early, once, before you trust the
+suite. The GST-over-budget refusal wasn't a bug at all — it's the whole point,
+and it only showed up because the run was real.
+
+**Cost:** ~40 minutes across the four, most of it the two-line `message_text`
+normaliser and realising the category field needed the merchant's vocabulary,
+not the user's words.

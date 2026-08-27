@@ -6,13 +6,16 @@ bounded authority.
 **Razorpay AI Buildathon — Track 01, AI Growth & Agentic Commerce.**
 
 > **Status: in development.** The mandate layer, quote engine, enforcement **Gate**,
-> hash-chained **audit ledger**, quote/intent persistence, the merchant **API**, and
-> the full money path — order creation, a checkout page, and webhook receipt — are
-> built and tested (251 tests, offline and deterministic). The live path is proven
-> against test-mode Razorpay: a real order created through the Orders API, and real
-> webhooks received and HMAC-verified through a public tunnel. Next: a successful
-> capture (the test card was blocked as international; UPI test payments clear it)
-> and the buyer/merchant agent layer. Demo and video to follow.
+> hash-chained **audit ledger**, quote/intent persistence, the merchant **API**, the
+> full money path — order creation, a checkout page, and webhook receipt — and the
+> **autonomous buyer agent** are built and tested (314 tests, offline and
+> deterministic). The live path is proven against test-mode Razorpay: driven by a
+> single typed sentence, the buyer agent plans, searches, selects, signs a Cart
+> Mandate, passes the Gate, and creates a **real** test-mode order end to end —
+> and an over-budget cart is refused by the merchant Gate on the real total (GST
+> included), exactly as intended. Next: the successful capture (the generic test
+> card reads as international; UPI test payments clear it), the merchant-side agent
+> org and negotiation, the red-team suite, and the demo/video.
 
 ## The idea
 
@@ -54,9 +57,13 @@ when it ships. Nothing here claims to implement UAP.
 | `merchant/checkout_page.py` | The one human step: a Razorpay Standard Checkout page to pay a created order with a test card/UPI |
 | `merchant/api.py` | FastAPI surface: catalog search, quote, checkout (runs the Gate, then creates the order), `/pay/{order_id}`, `/webhook`, ledger |
 | `buyer/llm.py` | LLM wiring behind a rate guard. Gemini for anything numeric; an NVIDIA 8B fast lane for prose-only surfaces. Structurally off the money path |
+| `buyer/agent.py` | The buyer's deterministic executor: PLAN → DISCOVER → EVALUATE → COMMIT → RECOVER state machine. Loads the signing key, builds and signs the Cart Mandate, submits it, and drives every transition. A model node may propose only `[{sku, qty}]`; nothing model-derived reaches the signing step |
+| `buyer/intent_compiler.py` | Turns a human sentence into a bounded Intent Mandate draft, renders a plain-English readback for the human to sign. The model returns whole rupees; Python converts to paise, so the model never emits a money value |
+| `buyer/planner.py` · `discovery.py` · `evaluator.py` | The buyer's judgment surfaces: feasibility/strategy, catalog search + candidate selection, and the final cart choice. Language and selection only — never a price, never a signature |
 
-Specified in `docs/specs/`, not yet implemented: the buyer **agent state machine**
-and the seventeen agent surfaces that drive the merchant.
+Implemented and driven end to end. Still specified-only in `docs/specs/`: the
+merchant-side agent org (storefront, sales, negotiation, refusal explainer), the
+red-team suite, and the observability agents.
 
 ## The part worth reading
 
@@ -96,7 +103,7 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Razorpay test-mode 
 ```bash
 uv sync --extra dev
 cp .env.example .env   # then fill in your keys
-uv run pytest -q       # 251 tests, offline and deterministic
+uv run pytest -q       # 314 tests, offline and deterministic
 ```
 
 Note `--extra dev`: a bare `uv sync` omits pytest, and `uv run pytest` will then
@@ -124,3 +131,14 @@ It grants an intent, quotes, signs a Cart Mandate, passes the Gate, and creates
 a **real** test-mode order, then prints a pay URL. Open it and pay with UPI
 `success@razorpay` (the generic `4111…` card is often blocked as international on
 test accounts). Razorpay's webhook then completes the ledger.
+
+### The autonomous buyer agent (needs a Gemini key)
+
+With the merchant running (above) and `GEMINI_API_KEY` set, the buyer agent
+takes it from a single sentence — no scripted steps. It compiles the sentence
+into an Intent Mandate, shows a readback to sign, then plans, searches the
+catalog, selects a cart, signs the Cart Mandate, and submits it to the Gate,
+stopping at the one human step (paying the created order). An over-budget
+request is refused by the merchant Gate on the real GST-inclusive total, and the
+agent reports why — enforcement stays on the merchant side, never in the
+agent's good behaviour.
