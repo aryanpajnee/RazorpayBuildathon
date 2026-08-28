@@ -33,11 +33,19 @@ INTENTS_DB = DATA_DIR / "intents.db"            # granted+verified intents and t
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")
 
 # NVIDIA's NIM endpoint is OpenAI-compatible, reached through langchain-openai
-# with a custom base_url. Benchmarked live 26 Aug: the 8B is ~0.4s/call and
-# correct on prose + tool-calls, but it mis-scaled rupees->paise (returned 5000
-# where 500000 was required). So it is a FAST LANE FOR PROSE ONLY and must never
-# be routed a numeric or mandate-drafting task — see FAST_LLM_SURFACES below.
-NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.1-8b-instruct")
+# with a custom base_url. This is the FAST LANE FOR PROSE ONLY — nothing numeric
+# or mandate-drafting is ever routed here (see FAST_LLM_SURFACES below); the
+# original 8B was benchmarked 26 Aug mis-scaling rupees->paise (returned 5000
+# where 500000 was required), so the prose-only rule is a permanent safety
+# stance, kept regardless of which model backs the lane.
+#
+# Model history: the lane originally used meta/llama-3.1-8b-instruct, which NVIDIA
+# retired (HTTP 410 "Gone") on 2026-08-26 along with the rest of the Llama family
+# — caught live during the Phase 5 demo (see FAILURES.md). Current lane model is
+# openai/gpt-oss-20b, verified live. `buyer/llm.py` also now degrades a failed
+# fast-lane call to the default provider, so a future model EOL cannot silently
+# break a prose surface again.
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
 MODELS = {

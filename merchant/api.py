@@ -42,6 +42,9 @@ from pydantic import BaseModel
 import config
 from core.ledger import all_entries, append
 from merchant import catalog, gateway, webhooks
+from merchant.agents import refusal_explainer, sales, storefront, substitution
+from merchant.agents import catalog as catalog_agent
+from merchant.agents import negotiator as merchant_negotiator
 from merchant.catalog import all_products, resolve_lines
 from merchant.checkout_page import render_checkout_page
 from merchant.gate import check
@@ -65,6 +68,44 @@ class QuoteRequest(BaseModel):
 
 class CheckoutRequest(BaseModel):
     cart_envelope: dict
+
+
+# --- merchant agent-org request bodies (surfaces #1-#6) ----------------------
+
+
+class StorefrontRequest(BaseModel):
+    message: str
+    context: str = ""
+
+
+class SemanticSearchRequest(BaseModel):
+    query: str
+    intent: dict | None = None
+    limit: int = 10
+
+
+class UpsellRequest(BaseModel):
+    cart: list[dict]
+    intent: dict
+
+
+class NegotiateRequest(BaseModel):
+    buyer_cart: list[dict]
+    buyer_message: str = ""
+    intent: dict
+    turn: int = 1
+
+
+class SubstituteRequest(BaseModel):
+    sku: str
+    reason: str = "no_fit"
+    intent: dict
+
+
+class RefusalExplainRequest(BaseModel):
+    reason_code: str
+    message: str = ""
+    detail: dict = {}
 
 
 # --- catalog -------------------------------------------------------------
@@ -332,6 +373,80 @@ async def post_webhook(request: Request) -> dict:
         "replay": result["replay"],
         "quote_id": result["quote_id"],
     }
+
+
+# --- merchant agent org (surfaces #1-#6) -------------------------------------
+# Thin adapters over the LLM agent modules in merchant/agents/. These are
+# advisory surfaces OFF the money path: none of them signs, quotes, computes an
+# authoritative total, or reaches Razorpay — the buyer still has to go through
+# POST /quote and POST /checkout (the Gate) to actually transact. So, like the
+# Gate itself, they never raise on a bad/agent-failed result; each returns HTTP
+# 200 with a safe fallback the caller can branch on, so a live negotiation loop
+# or a storefront chat never dead-ends on a transient model hiccup. This is also
+# the surface a Phase 7 MCP server will expose to any external MCP client.
+
+
+@app.post("/storefront")
+def post_storefront(body: StorefrontRequest) -> dict:
+    """#1 Storefront — conversational front door. `reply` never raises (it has
+    its own deterministic fallback), so this is a straight pass-through."""
+    return {"reply": storefront.reply(buyer_message=body.message, context=body.context)}
+
+
+@app.post("/catalog/semantic_search")
+def post_semantic_search(body: SemanticSearchRequest) -> dict:
+    """#2 Catalog — semantic search over the merchant's own inventory."""
+    try:
+        products = catalog_agent.search(query=body.query, intent=body.intent, limit=body.limit)
+    except Exception:  # noqa: BLE001 - advisory surface: never 500 on a model hiccup
+        products = []
+    return {"products": products}
+
+
+@app.post("/sales/upsell")
+def post_upsell(body: UpsellRequest) -> dict:
+    """#3 Sales — upsell/cross-sell. Deliberately NOT budget-limited here; the
+    Gate is what refuses an over-ceiling cart, even the merchant's own."""
+    try:
+        result = sales.upsell(cart=body.cart, intent=body.intent)
+    except Exception:  # noqa: BLE001
+        result = {"add": [], "pitch": ""}
+    return result
+
+
+@app.post("/negotiate")
+def post_negotiate(body: NegotiateRequest) -> dict:
+    """#4 Merchant Negotiator — one counter-turn. On any failure returns a
+    safe `hold` (the buyer's own cart, unchanged) so the bounded negotiation
+    loop on the buyer side always makes progress rather than erroring out."""
+    try:
+        return merchant_negotiator.counter(
+            buyer_cart=body.buyer_cart,
+            buyer_message=body.buyer_message,
+            intent=body.intent,
+            turn=body.turn,
+        )
+    except Exception:  # noqa: BLE001
+        return {"action": "hold", "cart": body.buyer_cart, "message": "Holding at the current offer."}
+
+
+@app.post("/substitute")
+def post_substitute(body: SubstituteRequest) -> dict:
+    """#5 Substitution — equivalent alternatives for an unavailable/over-budget SKU."""
+    try:
+        alternatives = substitution.substitute(sku=body.sku, reason=body.reason, intent=body.intent)
+    except Exception:  # noqa: BLE001
+        alternatives = []
+    return {"alternatives": alternatives}
+
+
+@app.post("/refusal/explain")
+def post_refusal_explain(body: RefusalExplainRequest) -> dict:
+    """#6 Refusal Explainer — a Gate refusal -> plain English + a fix. `explain`
+    already never raises (deterministic template fallback), so this passes through."""
+    return refusal_explainer.explain(
+        reason_code=body.reason_code, message=body.message, detail=body.detail
+    )
 
 
 # --- ledger ------------------------------------------------------------------

@@ -17,17 +17,25 @@ second-guessed), and judgment (buyer/planner.py, buyer/discovery.py,
 buyer/evaluator.py — this file calls them as opaque functions and validates
 their *shape*, never their *reasoning*).
 
-PHASE 4 SCOPE NOTE (Decision A, from the coordinator): the Buyer Negotiator
-(#11) and Recovery (#12) are Phase 5 agent surfaces. In this deployment:
-  - COMMIT never negotiates and never pre-checks the quote against the
-    budget client-side. It signs and submits the cart exactly as quoted and
-    lets the Gate refuse an over-budget cart — trusting a buyer-side check
-    over the Gate's own re-derivation is exactly the failure mode this
-    project's whole architecture exists to rule out. `negotiation_turns`
-    therefore never leaves 0 in this deployment, and NEGOTIATION_STALEMATE
-    cannot fire.
-  - RECOVER is this file's OWN deterministic code (S6's classification and
-    adjustment table), not an LLM call. No `buyer/recovery.py` exists yet.
+PHASE 5 SCOPE NOTE: the Buyer Negotiator (#11) and Recovery (#12) are now real
+LLM agent surfaces, wired in ADDITIVELY and OPTIONALLY through two injected
+callables on `run()`:
+  - `negotiate_fn` (default None): when supplied, COMMIT runs a one-time,
+    turn-capped A2A negotiation (`buyer/negotiation.py` orchestrating buyer #11
+    against the merchant's #4 over `POST /negotiate`) to settle `state.selected`
+    before it is quoted. It still NEVER pre-checks the quote against the budget
+    client-side — negotiation only changes WHICH real catalog items are in the
+    cart; the Gate re-derives and enforces the total. With no negotiate_fn,
+    COMMIT behaves exactly as in Phase 4 and `negotiation_turns` stays 0.
+  - `recovery_fn` (default None): when supplied, RECOVER delegates ONLY the
+    OVER_LIMIT cart-adjustment decision to the LLM node #12, validated against
+    the same strict signing-boundary schema, with the deterministic
+    `_drop_most_expensive` as a guaranteed fallback. With no recovery_fn,
+    RECOVER is exactly the Phase 4 deterministic table (S6). The classification
+    (`_GATE_CODE_FAMILY`), the attempt cap, and every transition are unchanged
+    either way — the LLM only ever proposes a cart, never a control decision.
+Both defaults are None, so the Phase 4 behaviour (and its whole test suite) is
+preserved bit-for-bit; the live/demo path passes the real callables.
 
 THE SIGNING BOUNDARY (S4), restated as an invariant this file must never
 break: the agent's Ed25519 signing key is loaded once, held as a local
@@ -112,7 +120,12 @@ class AgentState:
     # bounded counters — see S7
     attempt_count: int = 0
     negotiation_turns: int = 0
+    negotiated: bool = False          # Phase 5: negotiation runs at most once per run
     model_calls_used: dict[Phase, int] = field(default_factory=dict)
+
+    # Phase 5 negotiation transcript (for the terminal UI / audit); empty unless
+    # a negotiate_fn was supplied to run().
+    negotiation_transcript: list[dict] = field(default_factory=list)
 
     # diagnostics
     last_failure: dict | None = None         # {reason, code, recoverable, detail}
@@ -381,8 +394,53 @@ def _drop_most_expensive(state: AgentState) -> str | None:
     return most_expensive["sku"]
 
 
-def _recover(state: AgentState) -> None:
-    """RECOVER, spec S6, Decision A (deterministic stub — no LLM call).
+def _apply_recovery(state: AgentState, *, recovery_fn, intent: dict | None) -> list[dict] | None:
+    """Decide the OVER_LIMIT cart adjustment.
+
+    Phase 5: with an LLM Recovery node (`recovery_fn`, agent #12) this asks the
+    model which line(s) to drop or substitute, validates the proposal against
+    the SAME strict signing-boundary schema the Evaluator's output must pass
+    (`_validate_selected`, `extra="forbid"`), and uses it only if it is a
+    non-empty, valid, actually-different cart. On a `None` recovery_fn, an
+    empty/failed/invalid/no-op proposal, or ANY raise, it falls back to the
+    deterministic `_drop_most_expensive`.
+
+    So the LLM proposes but a deterministic rule guarantees forward progress —
+    the run can never stall because a model returned nothing usable. The money
+    boundary is unchanged either way: the proposal is skus-only, the old quote
+    is discarded, and the merchant re-quotes and the Gate re-checks the new
+    cart. Returns the (already-applied) new selection, or `None` if the cart is
+    emptied (caller turns that into ABANDONED, exactly as before).
+    """
+    if recovery_fn is not None:
+        try:
+            proposed = recovery_fn(
+                failure=state.last_failure or {},
+                cart=list(state.selected),
+                candidates=list(state.candidates),
+                intent=intent or {},
+            )
+            validated = _validate_selected(proposed)
+            if validated and validated != state.selected:
+                state.selected = validated
+                _log(state, Phase.RECOVER, "node_result", {"recovery": "llm", "selected": validated})
+                return validated
+        except Exception as exc:  # noqa: BLE001 - deterministic fallback below guarantees progress
+            _log(state, Phase.RECOVER, "node_result", {"recovery": "llm_failed", "error": str(exc)})
+
+    dropped = _drop_most_expensive(state)
+    if dropped is None:
+        return None
+    _log(state, Phase.RECOVER, "node_result", {"recovery": "deterministic", "dropped": dropped})
+    return state.selected
+
+
+def _recover(state: AgentState, *, recovery_fn=None, intent: dict | None = None) -> None:
+    """RECOVER, spec S6. Deterministic transition machine; Phase 5 optionally
+    delegates only the OVER_LIMIT *cart adjustment* to an LLM node (#12) via
+    `recovery_fn` — see `_apply_recovery`. The classification, the attempt cap,
+    and which phase to loop back to all stay here, unchanged, whether or not an
+    LLM recovery node is wired in.
 
     The off-by-one that matters: `attempt_count` increments FIRST, on every
     entry to RECOVER, before anything else — including before checking the
@@ -413,8 +471,8 @@ def _recover(state: AgentState) -> None:
         return
 
     if reason == "GATE_REFUSAL" and code == "OVER_LIMIT":
-        dropped = _drop_most_expensive(state)
-        if dropped is None:
+        adjusted = _apply_recovery(state, recovery_fn=recovery_fn, intent=intent)
+        if adjusted is None:
             _terminal(
                 state,
                 Phase.ABANDONED,
@@ -533,6 +591,8 @@ def run(
     discovery_fn=discovery_module.discover,
     evaluator_fn=evaluator_module.evaluate,
     confirm_payment=None,
+    negotiate_fn=None,
+    recovery_fn=None,
 ) -> AgentState:
     """Drive `goal` from a signed Intent Mandate envelope to a terminal
     `AgentState` — COMPLETED, ABANDONED, or FAILED.
@@ -701,6 +761,37 @@ def run(
 
             # --- COMMIT (S4 — pure deterministic code, no model call) ------
             if phase == Phase.COMMIT:
+                # Phase 5: optional one-time A2A negotiation (buyer #11 <-> merchant
+                # #4) before the cart is quoted and signed. Skipped entirely when
+                # no negotiate_fn is supplied — the Phase 4 default. Guarded by
+                # state.negotiated so it runs at most once per run and RECOVER's
+                # loop back to COMMIT never re-opens a haggle. On ANY outcome it
+                # proceeds with a real catalog-shaped cart: negotiation only
+                # improves or leaves the cart unchanged, never blocks a purchase
+                # the buyer already chose, and the Gate still bounds whatever is
+                # agreed. Every argument to make_cart_mandate below still comes
+                # from the merchant's own quote, never from this negotiation.
+                if negotiate_fn is not None and not state.negotiated:
+                    state.negotiated = True
+                    try:
+                        neg = negotiate_fn(selected=state.selected, intent=payload, http=http)
+                    except Exception as exc:  # noqa: BLE001 - a haggle must never break the run
+                        _log(state, Phase.COMMIT, "node_result", {"negotiation": "failed", "error": str(exc)})
+                        neg = None
+                    if neg:
+                        state.negotiation_turns = neg.get("turns", 0)
+                        state.negotiation_transcript = neg.get("transcript", [])
+                        agreed = neg.get("cart")
+                        try:
+                            agreed = _validate_selected(agreed) if agreed else []
+                        except NodeError:
+                            agreed = []  # a malformed agreed cart is ignored; keep the buyer's own selection
+                        if agreed and agreed != state.selected:
+                            state.selected = agreed
+                            state.quote = None  # composition changed — requote
+                        _log(state, Phase.COMMIT, "node_result",
+                             {"negotiation": neg.get("outcome"), "turns": state.negotiation_turns})
+
                 try:
                     items = _validate_selected(state.selected)
                 except NodeError as exc:
@@ -840,7 +931,7 @@ def run(
 
             # --- RECOVER ---------------------------------------------------
             if phase == Phase.RECOVER:
-                _recover(state)
+                _recover(state, recovery_fn=recovery_fn, intent=payload)
                 continue
 
             raise AssertionError(f"unreachable phase in the main loop: {phase!r}")  # pragma: no cover

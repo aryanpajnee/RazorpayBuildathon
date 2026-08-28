@@ -386,17 +386,20 @@ class LLMGateway:
         self._sleep_fn = sleep_fn
         self._purpose_counts: Counter[str] = Counter()
 
-    def _model_for(self, purpose: str):
-        """The chat model this purpose should use. An injected model wins; else
-        route to a provider and lazily build+cache that provider's model."""
-        if self._explicit_model is not None:
-            return self._explicit_model
-        provider = provider_for_purpose(purpose)
+    def _provider_model(self, provider: str):
+        """Lazily build and cache the chat model for one explicit provider."""
         model = self._models_by_provider.get(provider)
         if model is None:
             model = get_chat_model(provider=provider)
             self._models_by_provider[provider] = model
         return model
+
+    def _model_for(self, purpose: str):
+        """The chat model this purpose should use. An injected model wins; else
+        route to a provider and lazily build+cache that provider's model."""
+        if self._explicit_model is not None:
+            return self._explicit_model
+        return self._provider_model(provider_for_purpose(purpose))
 
     def invoke(self, messages, *, purpose: str):
         """Call the underlying model, guarded and retried.
@@ -406,7 +409,17 @@ class LLMGateway:
         whole point of having one. A `DailyBudgetExceededError` from the
         guard is never retried; it propagates immediately.
         """
-        model = self._model_for(purpose)  # resolved once: retries stay on one provider
+        # Resolve provider + model once so retries stay on one provider. An
+        # injected explicit model (tests, single-provider callers) overrides
+        # routing and has nowhere to degrade to; `provider is None` marks that.
+        if self._explicit_model is not None:
+            model = self._explicit_model
+            provider: str | None = None
+        else:
+            provider = provider_for_purpose(purpose)
+            model = self._provider_model(provider)
+
+        degraded = False
         last_error: BaseException | None = None
         for attempt in range(1, self._max_attempts + 1):
             self._guard.acquire()
@@ -416,12 +429,28 @@ class LLMGateway:
             except DailyBudgetExceededError:
                 raise
             except Exception as exc:  # noqa: BLE001 - classified below
-                if not _is_transient(exc):
-                    raise
-                last_error = exc
-                if attempt < self._max_attempts:
-                    delay = self._backoff_base_seconds * (2 ** (attempt - 1))
-                    self._sleep_fn(delay)
+                if _is_transient(exc):
+                    last_error = exc
+                    if attempt < self._max_attempts:
+                        delay = self._backoff_base_seconds * (2 ** (attempt - 1))
+                        self._sleep_fn(delay)
+                    continue
+                # Non-transient. A FAST-LANE (non-default) provider that fails
+                # outright — e.g. NVIDIA retiring its model with an HTTP 410, as
+                # happened live on 2026-08-26 — degrades ONCE to the default
+                # provider so a prose surface stays alive instead of hard-failing
+                # (or, at an endpoint, silently returning nothing). The default
+                # provider has nowhere to fall back to, so its own non-transient
+                # errors still propagate. Only prose surfaces route to the fast
+                # lane, so degrading to Gemini here never puts a numeric task on
+                # a model that shouldn't do arithmetic — the routing already
+                # guaranteed that upstream.
+                if not degraded and provider is not None and provider != config.LLM_PROVIDER:
+                    degraded = True
+                    last_error = exc
+                    model = self._provider_model(config.LLM_PROVIDER)
+                    continue
+                raise
 
         assert last_error is not None  # the loop always sets this before exiting
         raise RetryBudgetExceededError(self._max_attempts, last_error)

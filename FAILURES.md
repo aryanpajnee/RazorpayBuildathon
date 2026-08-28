@@ -459,3 +459,57 @@ and it only showed up because the run was real.
 **Cost:** ~40 minutes across the four, most of it the two-line `message_text`
 normaliser and realising the category field needed the merchant's vocabulary,
 not the user's words.
+
+---
+
+## Phase 5 — the merchant agent org, and three things only the live demo showed (27 Aug)
+
+Phase 5 built the six merchant agents (#1–#6), the buyer Negotiator (#11) and
+Recovery (#12) as real LLM nodes, wired the bounded negotiation loop and the LLM
+recovery into `buyer/agent.py` additively (defaults preserve every Phase 4 test),
+and exposed the agent org over HTTP. 84 new hermetic tests passed. Then the live
+demo — real Gemini, the NVIDIA fast lane, real test-mode Razorpay — found three
+things the mocks could not.
+
+- **The NVIDIA fast-lane model was retired *yesterday*, mid-build.**
+  `meta/llama-3.1-8b-instruct` (and the entire Llama family on NVIDIA NIM) started
+  returning `HTTP 410 Gone — "reached its end of life on 2026-08-26"`. The
+  prose-only surfaces on that lane failed live: `storefront` fell back to its
+  canned reply and `substitution` silently returned `[]` (the endpoint's own
+  try/except swallowed the error), so the demo showed "0 in-stock alternatives"
+  for a category with seven. Two fixes: point the lane at `openai/gpt-oss-20b`
+  (probed live, the Llamas are all 410), **and** make `buyer/llm.py` degrade a
+  failed fast-lane call once to the default provider (Gemini) — so a future model
+  EOL can never again silently drop a prose surface. The prose-only routing means
+  degrading to Gemini never puts a numeric task on the wrong model. A pinned model
+  id is a dependency with an expiry date; the guard is the actual fix.
+
+- **The Gate enforces the authorised *category*, not just the amount.**
+  The Sales agent (#3), doing its job, cross-sold socks and a recovery slide into a
+  **footwear-only** intent. The over-limit refusal fired first (huge total), but
+  after Recovery cut the price, the Gate then refused `CATEGORY_MISMATCH` — socks
+  are not footwear, and the intent only authorised footwear. Not a bug: it is a
+  *second* bound (which categories, not only how much) working exactly as designed,
+  and a nice demonstration in its own right. The lesson for the buyer side:
+  Recovery must stay inside the signed authority — the demo's recovery now keeps
+  only in-category items before dropping to fit the ceiling.
+
+- **A negotiator that can't see prices can't negotiate.**
+  The first live negotiation had the buyer Negotiator (#11) *accept* a ₹8,999 shoe
+  against a ₹6,000 ceiling in zero turns. Cause: the original contract told it
+  "you do not know exact prices" — so it literally couldn't tell the offer was
+  over budget. Fix: show it whole-rupee prices *for reasoning only* (it still
+  returns skus/qty and never a price, exactly like Discovery/Evaluator), enriched
+  once by the loop from the merchant's own catalog. It now counters ("this exceeds
+  my budget ceiling"), the Merchant Negotiator (#4) concedes a genuinely cheaper
+  real-catalog shoe, and the buyer accepts — a real bounded haggle in one turn.
+
+**What proved it works.** One live run: storefront → semantic search → the Sales
+agent upsells to ₹13,566 → the merchant's own **Gate REFUSES OVER_LIMIT** (over
+by ₹7,566, GST-inclusive) → Refusal Explainer puts it in plain English → Recovery
+adjusts to a footwear-only cart under the ceiling → **Gate PASSES → real Razorpay
+order** (`order_TUkhdrFv3DXCql`) → a bounded #11⇄#4 negotiation settles a cheaper
+shoe → Substitution offers five in-stock alternatives for an out-of-stock SKU —
+and the hash-chained ledger holds `gate.refused`, `gate.passed`, and
+`order.created` for all of it. The headline — *the merchant's own growth agent,
+refused by the merchant's own Gate* — happened live, unscripted.

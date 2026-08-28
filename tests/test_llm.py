@@ -497,3 +497,58 @@ def test_gateway_routes_each_purpose_to_the_right_provider_model(monkeypatch):
     # each provider built exactly once, then cached
     gateway._model_for("intent_compiler")
     assert built.count("gemini") == 1 and built.count("nvidia") == 1
+
+
+def test_fast_lane_non_transient_failure_degrades_to_the_default_provider(monkeypatch):
+    """A prose surface routed to the fast lane must not hard-fail when that
+    provider dies outright (e.g. NVIDIA's HTTP 410 model-retirement on
+    2026-08-26). It degrades ONCE to the default provider and still returns a
+    result — so a live demo (or an endpoint) never silently loses a prose
+    surface to a dead upstream model."""
+    from buyer import llm as llm_module
+
+    monkeypatch.setattr(llm_module, "provider_for_purpose", lambda purpose: "nvidia")
+
+    class Gone:
+        def invoke(self, messages):
+            raise RuntimeError("Error code: 410 - model has reached end of life")
+
+    class Default:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            return "degraded-ok"
+
+    default_model = Default()
+
+    def fake_provider_model(provider):
+        return Gone() if provider == "nvidia" else default_model
+
+    guard, _ = make_guard(rpm_limit=15, daily_limit=1500)
+    gateway = LLMGateway(guard=guard, sleep_fn=lambda _s: None)  # no explicit model -> real routing
+    monkeypatch.setattr(gateway, "_provider_model", fake_provider_model)
+
+    result = gateway.invoke([], purpose="storefront")
+    assert result == "degraded-ok"
+    assert default_model.calls == 1
+
+
+def test_default_provider_non_transient_failure_still_propagates(monkeypatch):
+    """The default provider has nowhere to degrade to, so its own non-transient
+    error is not swallowed — degradation is strictly a fast-lane safety net."""
+    from buyer import llm as llm_module
+
+    monkeypatch.setattr(llm_module, "provider_for_purpose", lambda purpose: config.LLM_PROVIDER)
+
+    class Boom:
+        def invoke(self, messages):
+            raise ValueError("malformed prompt")
+
+    guard, _ = make_guard(rpm_limit=15, daily_limit=1500)
+    gateway = LLMGateway(guard=guard, sleep_fn=lambda _s: None)
+    monkeypatch.setattr(gateway, "_provider_model", lambda provider: Boom())
+
+    with pytest.raises(ValueError):
+        gateway.invoke([], purpose="planner")
