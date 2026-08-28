@@ -159,3 +159,46 @@ USER_KEY_NAME = "user"                 # Ed25519 key the user signs Intent Manda
 # timeout here is deliberately NOT a terminal state: it means the human
 # simply hasn't paid yet, not that anything failed.
 PAYMENT_CONFIRM_TIMEOUT_SECONDS = 180
+
+# --- Phase 6: red team ------------------------------------------------------
+# Where the Attack Judge (#15) writes its per-attack findings, one JSON file
+# each. Curated into FAILURES.md by hand — the directory is the machine's
+# scratch output, FAILURES.md is the human record.
+REDTEAM_FINDINGS_DIR = ROOT / "redteam" / "findings"
+
+# Hard bound on the autonomous Attacker (#13): how many attack hypotheses it
+# will form and fire in one run before stopping. Same spirit as ATTEMPT_CAP /
+# NEGOTIATION_TURN_CAP — an LLM-driven loop against the merchant must fail on a
+# fixed budget, never run unbounded against the shared Gemini quota or the API.
+ATTACKER_MAX_HYPOTHESES = 6
+
+# --- Phase 7: the React live console ----------------------------------------
+# The FastAPI backend behind ui/web (the React app). Separate port from the
+# merchant API so the demo can run both side by side. UI_STREAM_STEP_SECONDS
+# paces the Server-Sent-Events stream so the gate checks and hash chain animate
+# at a watchable speed on camera rather than all landing in one frame.
+UI_HOST = "127.0.0.1"
+UI_PORT = 8100
+UI_STREAM_STEP_SECONDS = 0.5
+
+# --- Phase 7: MCP server + observability + UI -------------------------------
+# The merchant's MCP surface. `merchant/mcp_server.py` exposes the merchant to
+# any MCP client (Claude Desktop, Claude Code, another agent) as three tools —
+# search_catalog, get_quote, checkout — thin adapters over the SAME money path
+# the HTTP API already guards. MCP is transport, never a bypass of the Gate.
+MCP_SERVER_NAME = "northwind-merchant"
+MCP_HOST = "127.0.0.1"
+MCP_PORT = 8765
+
+# Metrics agent (#17): how many buyer runs the batch drives to measure AOV lift
+# (sales agent on vs off), attach rate, autonomous-purchase count and bounded-
+# upsell refusals. Every one of those numbers is deterministic Python — the LLM
+# never computes a metric (numbers-audit discipline).
+METRICS_BATCH_SIZE = 20
+METRICS_DIR = DATA_DIR / "metrics"       # where #17 writes its computed tables
+
+# The live terminal/React UI (Phase 7) reads from a real run + the ledger and
+# re-implements no money logic. This is the FastAPI backend the React app talks
+# to; the Vite dev server proxies to it.
+UI_HOST = "127.0.0.1"
+UI_PORT = 8100

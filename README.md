@@ -5,19 +5,24 @@ bounded authority.
 
 **Razorpay AI Buildathon — Track 01, AI Growth & Agentic Commerce.**
 
-> **Status: in development.** The mandate layer, quote engine, enforcement **Gate**,
-> hash-chained **audit ledger**, quote/intent persistence, the merchant **API**, the
-> full money path — order creation, a checkout page, and webhook receipt — the
-> **autonomous buyer agent**, and the **merchant agent org** (storefront, semantic
-> search, sales/upsell, negotiation, substitution, refusal explainer) with real
-> agent-to-agent negotiation and LLM-driven recovery are built and tested (425
-> tests, offline and deterministic). The live path is proven against test-mode
-> Razorpay: the merchant's own **sales agent upsells a cart past the user's signed
-> ceiling and the merchant's own Gate refuses it** (OVER_LIMIT), then the recovery
-> agent adjusts the cart back under the limit and a **real** test-mode order is
-> created end to end. **12 of 17 agent surfaces** are built. Next: the successful
-> capture (the generic test card reads as international; UPI test payments clear
-> it), the red-team suite, the observability agents, and the demo/video.
+> **Status: feature-complete, pre-submission.** The mandate layer, quote engine,
+> enforcement **Gate**, hash-chained **audit ledger**, quote/intent persistence, the
+> merchant **API**, the full money path — order creation, a checkout page, and
+> webhook receipt — the **autonomous buyer agent**, the **merchant agent org**
+> (storefront, semantic search, sales/upsell, negotiation, substitution, refusal
+> explainer), the **red team** (autonomous attacker, prompt-injection injector,
+> deterministic attack judge), the **observability agents** (ledger auditor,
+> merchant-value metrics), an **MCP server** that lets any MCP client shop the
+> merchant, and a **React live console** are all built and tested (**518 tests,
+> offline and deterministic**). **All 17 agent surfaces are built.** The live path
+> is proven against test-mode Razorpay: the merchant's own **sales agent upsells a
+> cart past the user's signed ceiling and the merchant's own Gate refuses it**
+> (OVER_LIMIT), the recovery agent adjusts the cart back under the limit and a
+> **real** test-mode order is created end to end (`order_TVEeDvW8Kk8kFC`), and a
+> purchase completes **through the MCP server** as well (`order_TVEeqIzxMnqoKU`).
+> The one remaining human step is the successful **capture** (paying a created
+> order — UPI `success@razorpay` clears it; the generic `4111…` card reads as
+> international on test accounts).
 
 ## The idea
 
@@ -64,9 +69,14 @@ when it ships. Nothing here claims to implement UAP.
 | `buyer/planner.py` · `discovery.py` · `evaluator.py` | The buyer's judgment surfaces: feasibility/strategy, catalog search + candidate selection, and the final cart choice. Language and selection only — never a price, never a signature |
 | `buyer/negotiator.py` · `recovery.py` · `negotiation.py` | The buyer's negotiator (haggles for a cheaper cart) and recovery node (diagnoses a refusal and adjusts the cart), plus the bounded, turn-capped loop that runs the negotiator against the merchant's. Both return `[{sku, qty}]` only |
 | `merchant/agents/*.py` | The merchant agent org (#1–#6): a conversational storefront, semantic catalog search, a sales/upsell agent, a negotiator that concedes only genuinely cheaper real-catalog carts, a substitution agent for out-of-stock items, and a refusal explainer. All advisory and off the money path — they propose or explain, and the Gate still re-derives and enforces every price |
+| `redteam/*.py` | The red team (#13–#15): an autonomous **attacker** that forms hypotheses and mutates cart mandates on a bounded loop, an **injector** that writes poisoned product copy, and an **attack judge**. The judge's verdict (defended/breach) is pure deterministic Python — the LLM only narrates it, never decides it. The attacker never moves money and never decides pass/fail |
+| `observability/auditor.py` | The **Auditor** (#16): reads the ledger and writes a plain-English incident report — what happened, under whose authority, why refused. Prose-only with a deterministic fallback; it copies every figure verbatim from a ledger payload and computes no number |
+| `observability/metrics.py` | The **Metrics** agent (#17): the four merchant-value numbers (AOV lift, attach rate, autonomous-revenue channel, bounded-upsell refusals) plus the attack table. Every number is deterministic integer arithmetic — the LLM computes none. `scripts/metrics_batch.py` drives it over the real money path |
+| `merchant/mcp_server.py` | An **MCP server** exposing the merchant to any MCP client (Claude, another agent) as `search_catalog` / `get_quote` / `checkout` / `buy`. A transport adapter over the real API, never a second door — `checkout` reaches the same Gate and real Razorpay order path |
+| `ui/` | A **React live console** (Vite + TypeScript) over a FastAPI SSE backend: three panels — the agent conversation, the Gate's seven checks flipping PASS/REFUSE, and the hash chain growing — driven by the real Gate, quote store and ledger. Built for the demo video |
 
-Implemented and driven end to end. Not built yet: the red-team suite (#13–#15)
-and the observability agents (#16–#17).
+Implemented and driven end to end. All 17 agent surfaces plus the money-path
+vault, the MCP server, and the live console are built.
 
 ## The part worth reading
 
@@ -106,7 +116,7 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Razorpay test-mode 
 ```bash
 uv sync --extra dev
 cp .env.example .env   # then fill in your keys
-uv run pytest -q       # 425 tests, offline and deterministic
+uv run pytest -q       # 518 tests, offline and deterministic
 ```
 
 Note `--extra dev`: a bare `uv sync` omits pytest, and `uv run pytest` will then
@@ -162,3 +172,40 @@ adjusts the cart back under the limit and a **real** order is created, the buyer
 and merchant negotiators settle a cheaper cart in a bounded loop, and the
 substitution agent offers in-stock alternatives for an out-of-stock item — with
 every step landing in the hash-chained ledger.
+
+### The MCP server — any AI client can shop the merchant
+
+With the merchant running, expose it over the Model Context Protocol:
+
+```bash
+uv run python -m merchant.mcp_server                    # stdio, for Claude Desktop/Code
+uv run python -m merchant.mcp_server --transport streamable-http   # or over HTTP
+```
+
+`search_catalog`, `get_quote`, and `checkout` are thin adapters over the running
+API, so an MCP client gets the exact same seven-check Gate enforcement as the
+buyer agent — MCP is a transport, never a bypass. A demo-only `buy` tool signs a
+Cart Mandate locally and completes a **real** test-mode order end to end.
+
+### The merchant-value metrics (needs a Gemini key)
+
+With the merchant running, drive a batch over the real money path and print the
+numbers for the pitch:
+
+```bash
+uv run python scripts/metrics_batch.py --runs 20
+```
+
+AOV lift with the sales agent on vs off, attach rate, autonomous-revenue channel,
+and how often the Gate refused the merchant's own sales agent — every figure is
+deterministic Python, never a model output.
+
+### The live console (the demo UI)
+
+A React three-panel console — the agent conversation, the Gate's seven checks
+flipping PASS/REFUSE, and the hash chain growing — driven by the real Gate:
+
+```bash
+cd ui/web && npm install && npm run build && cd ../..
+uv run uvicorn ui.server:app --port 8100     # then open http://127.0.0.1:8100
+```

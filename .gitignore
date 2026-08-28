@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 data/*.db
 data/keys/
+data/ui_demo/
+data/metrics/
 .pytest_cache/
 .DS_Store
 

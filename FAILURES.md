@@ -5,6 +5,54 @@ they read first, so it's written as things break — not reconstructed afterward
 
 ---
 
+## 2026-08-28 — Phase 6 was "done" in the notes and gone from the repo.
+
+**What broke.** Starting Phase 7, I went to build on top of Phase 6 and found
+the ground wasn't there. The build notes said "Phases 1–6 complete, 468 tests,
+15/17 surfaces." The repo said otherwise: `main` was still Phase 5 — 423 tests —
+and the entire Phase 6 red team (`redteam/attacker.py`, `injector.py`,
+`judge.py`, the adversarial suite, the Phase 6 demo) had **no source on disk and
+no commit anywhere**. Only stale `.pyc` bytecode sat in `redteam/__pycache__`.
+Separately, the agent-key-impersonation *fix* — the whole point of that red-team
+finding — was committed on an unmerged side branch, not on `main`. So there were
+three divergent states off one base and a set of notes that described a fourth,
+imaginary one. Building Phase 7 here would have meant new surfaces on a Gate with
+a known-critical hole and a "Metrics" agent importing a red team that didn't
+exist.
+
+**How I got out.** Before touching anything I went looking for the lost work
+rather than assuming it. `git rev-list --all --objects` still listed the
+red-team paths as reachable blobs, which meant they were alive somewhere — they
+turned out to be in a `git stash` created with `--include-untracked`, hiding in
+the stash's third parent (`stash@{0}^3`), which a plain `git stash show` never
+displays. I verified the sources were intact (`git cat-file -p`), then on a fresh
+`phase7` branch: fast-forwarded the security fix in, restored the red team out of
+the stash with `git checkout stash@{0}^3 -- …` (leaving the stash untouched as a
+backup), and re-added the two config keys. The restored red-team tests then
+failed — exactly as the plan had warned they would — because the fix made
+`agent_pubkey` a required, signature-covered field, so the pre-fix tests built
+intents the new Gate rejected. Fixed six tests to bind the signing key. Green
+baseline: 470, then 518 after Phase 7. **The lesson costs nothing to state and a
+lot to relearn: a phase isn't done when the tests pass in a working tree, it's
+done when it's committed. Uncommitted work is a rumour.**
+
+**Two smaller ones from the same session, kept honest.** (1) I ran the three
+Phase 7 backend surfaces as parallel Sonnet subagents; the agent infrastructure
+kept dropping them mid-file (stream watchdog, an API cutout, a session cap), so
+two left half-written files and one left nothing. I finished all three inline —
+the MCP server's only real bug was a missing `import httpx` and an async
+`ASGITransport` where a sync `TestClient` was needed. (2) The MCP SDK pinned here
+is 2.1.0, which moved the ergonomic server class from `mcp.server.fastmcp.FastMCP`
+to `mcp.server.mcpserver.MCPServer`; the import tries the old name first and
+falls back, so it works on either. (3) The first real metrics batch reports the
+attack table straight from the findings directory — which still contains the
+agent-key **breach** file, now fixed. So "1 breach / 50% defended" is a
+historical record, not current posture; re-running the red-team campaign against
+the fixed Gate is what produces an all-defended table. Written down rather than
+quietly massaged.
+
+---
+
 ## 2026-08-28 — Our own red team walked straight through the Gate.
 
 **What broke.** The Gate is the centrepiece — the single door between a signed
