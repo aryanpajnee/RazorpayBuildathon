@@ -7,15 +7,17 @@ bounded authority.
 
 > **Status: in development.** The mandate layer, quote engine, enforcement **Gate**,
 > hash-chained **audit ledger**, quote/intent persistence, the merchant **API**, the
-> full money path — order creation, a checkout page, and webhook receipt — and the
-> **autonomous buyer agent** are built and tested (314 tests, offline and
-> deterministic). The live path is proven against test-mode Razorpay: driven by a
-> single typed sentence, the buyer agent plans, searches, selects, signs a Cart
-> Mandate, passes the Gate, and creates a **real** test-mode order end to end —
-> and an over-budget cart is refused by the merchant Gate on the real total (GST
-> included), exactly as intended. Next: the successful capture (the generic test
-> card reads as international; UPI test payments clear it), the merchant-side agent
-> org and negotiation, the red-team suite, and the demo/video.
+> full money path — order creation, a checkout page, and webhook receipt — the
+> **autonomous buyer agent**, and the **merchant agent org** (storefront, semantic
+> search, sales/upsell, negotiation, substitution, refusal explainer) with real
+> agent-to-agent negotiation and LLM-driven recovery are built and tested (423
+> tests, offline and deterministic). The live path is proven against test-mode
+> Razorpay: the merchant's own **sales agent upsells a cart past the user's signed
+> ceiling and the merchant's own Gate refuses it** (OVER_LIMIT), then the recovery
+> agent adjusts the cart back under the limit and a **real** test-mode order is
+> created end to end. **12 of 17 agent surfaces** are built. Next: the successful
+> capture (the generic test card reads as international; UPI test payments clear
+> it), the red-team suite, the observability agents, and the demo/video.
 
 ## The idea
 
@@ -56,14 +58,15 @@ when it ships. Nothing here claims to implement UAP.
 | `merchant/webhooks.py` | Webhook receipt. HMAC over raw bytes, replay-safe |
 | `merchant/checkout_page.py` | The one human step: a Razorpay Standard Checkout page to pay a created order with a test card/UPI |
 | `merchant/api.py` | FastAPI surface: catalog search, quote, checkout (runs the Gate, then creates the order), `/pay/{order_id}`, `/webhook`, ledger |
-| `buyer/llm.py` | LLM wiring behind a rate guard. Gemini for anything numeric; an NVIDIA 8B fast lane for prose-only surfaces. Structurally off the money path |
+| `buyer/llm.py` | The shared LLM gateway for every agent surface, behind one rate guard. Gemini for anything numeric; an NVIDIA fast lane (`gpt-oss-20b`) for prose-only surfaces, which degrades to Gemini if it fails. Structurally off the money path |
 | `buyer/agent.py` | The buyer's deterministic executor: PLAN → DISCOVER → EVALUATE → COMMIT → RECOVER state machine. Loads the signing key, builds and signs the Cart Mandate, submits it, and drives every transition. A model node may propose only `[{sku, qty}]`; nothing model-derived reaches the signing step |
 | `buyer/intent_compiler.py` | Turns a human sentence into a bounded Intent Mandate draft, renders a plain-English readback for the human to sign. The model returns whole rupees; Python converts to paise, so the model never emits a money value |
 | `buyer/planner.py` · `discovery.py` · `evaluator.py` | The buyer's judgment surfaces: feasibility/strategy, catalog search + candidate selection, and the final cart choice. Language and selection only — never a price, never a signature |
+| `buyer/negotiator.py` · `recovery.py` · `negotiation.py` | The buyer's negotiator (haggles for a cheaper cart) and recovery node (diagnoses a refusal and adjusts the cart), plus the bounded, turn-capped loop that runs the negotiator against the merchant's. Both return `[{sku, qty}]` only |
+| `merchant/agents/*.py` | The merchant agent org (#1–#6): a conversational storefront, semantic catalog search, a sales/upsell agent, a negotiator that concedes only genuinely cheaper real-catalog carts, a substitution agent for out-of-stock items, and a refusal explainer. All advisory and off the money path — they propose or explain, and the Gate still re-derives and enforces every price |
 
-Implemented and driven end to end. Still specified-only in `docs/specs/`: the
-merchant-side agent org (storefront, sales, negotiation, refusal explainer), the
-red-team suite, and the observability agents.
+Implemented and driven end to end. Not built yet: the red-team suite (#13–#15)
+and the observability agents (#16–#17).
 
 ## The part worth reading
 
@@ -103,7 +106,7 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Razorpay test-mode 
 ```bash
 uv sync --extra dev
 cp .env.example .env   # then fill in your keys
-uv run pytest -q       # 314 tests, offline and deterministic
+uv run pytest -q       # 423 tests, offline and deterministic
 ```
 
 Note `--extra dev`: a bare `uv sync` omits pytest, and `uv run pytest` will then
@@ -142,3 +145,20 @@ stopping at the one human step (paying the created order). An over-budget
 request is refused by the merchant Gate on the real GST-inclusive total, and the
 agent reports why — enforcement stays on the merchant side, never in the
 agent's good behaviour.
+
+### The merchant agent org, live (needs a Gemini key)
+
+With the merchant running and `GEMINI_API_KEY` set, one script walks the whole
+Phase 5 story end to end against real models and test-mode Razorpay:
+
+```bash
+uv run python scripts/phase5_demo.py
+```
+
+The storefront greets, semantic search ranks the catalog, the **sales agent
+upsells a cart past the signed ceiling and the Gate refuses the merchant's own
+sales agent**, the refusal explainer puts it in plain English, the recovery agent
+adjusts the cart back under the limit and a **real** order is created, the buyer
+and merchant negotiators settle a cheaper cart in a bounded loop, and the
+substitution agent offers in-stock alternatives for an out-of-stock item — with
+every step landing in the hash-chained ledger.
