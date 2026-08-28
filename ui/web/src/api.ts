@@ -1,7 +1,16 @@
-// Types for the Server-Sent-Events stream from ui/server.py, and a tiny
-// helper to consume it. Every event mirrors a dict yielded by ui/scenario.py.
+// The Authority Bench talks to ui/server.py over plain JSON. Every response is
+// the real Gate's own decision plus the derived seven-check view and the new
+// ledger rows.
 
-export type CheckState = "pass" | "refuse" | "skip" | "pending";
+export interface Product {
+  sku: string;
+  name: string;
+  price_paise: number;
+  price_rupees: string;
+  in_stock: boolean;
+}
+
+export type CheckState = "pass" | "refuse" | "skip";
 
 export interface GateCheck {
   id: string;
@@ -9,55 +18,63 @@ export interface GateCheck {
   state: CheckState;
 }
 
-export type Role = "buyer" | "merchant" | "gate" | "system";
+export interface LedgerRow {
+  seq: number;
+  event_type: string;
+  entry_hash: string;
+  prev_hash: string;
+  payload: Record<string, unknown>;
+}
 
-export type StreamEvent =
-  | { type: "run_begin"; agent_id: string; ceiling_rupees: string }
-  | { type: "conversation"; role: Role; text: string }
-  | { type: "act"; n: number; title: string }
-  | {
-      type: "gate_begin";
-      cart_label: string;
-      total_paise: number | null;
-      total_rupees: string | null;
-      limit_paise: number;
-      limit_rupees: string;
-    }
-  | { type: "gate_check"; id: string; label: string; state: CheckState }
-  | {
-      type: "gate_result";
-      passed: boolean;
-      reason_code: string | null;
-      message: string;
-      detail: Record<string, unknown>;
-      total_paise: number | null;
-      total_rupees: string | null;
-    }
-  | {
-      type: "ledger";
-      seq: number;
-      event_type: string;
-      entry_hash: string;
-      prev_hash: string;
-      ts: number;
-      payload: Record<string, unknown>;
-    }
-  | { type: "chain"; ok: boolean; entries_checked: number; detail: string }
-  | { type: "run_end"; chain_ok: boolean; entries_checked: number; detail: string }
-  | { type: "stream_end" };
+export interface Chain {
+  ok: boolean;
+  entries_checked: number;
+  detail: string;
+  first_broken_seq: number | null;
+}
 
-// Open the stream and call `onEvent` for each event. Returns a stop function.
-export function openStream(onEvent: (e: StreamEvent) => void): () => void {
-  const source = new EventSource("/api/stream");
-  source.onmessage = (msg) => {
-    try {
-      const event = JSON.parse(msg.data) as StreamEvent;
-      onEvent(event);
-      if (event.type === "stream_end") source.close();
-    } catch {
-      /* ignore a malformed frame rather than tear down the whole run */
-    }
-  };
-  source.onerror = () => source.close();
-  return () => source.close();
+export interface Outcome {
+  cart_label: string;
+  replayed: boolean;
+  passed: boolean;
+  reason_code: string | null;
+  message: string;
+  detail: Record<string, unknown>;
+  total_paise: number | null;
+  total_rupees: string | null;
+  ceiling_paise: number;
+  ceiling_rupees: string;
+  agent_id: string;
+  agent_pubkey: string;
+  checks: GateCheck[];
+  ledger: LedgerRow[];
+  chain: Chain;
+  error?: string;
+}
+
+export async function fetchCatalog(): Promise<Product[]> {
+  const res = await fetch("/api/catalog");
+  const data = await res.json();
+  return data.products as Product[];
+}
+
+export interface SubmitBody {
+  ceiling_paise: number;
+  items: { sku: string; qty: number }[];
+  attacks: string[];
+  replay?: boolean;
+}
+
+export async function submitMandate(body: SubmitBody): Promise<Outcome> {
+  const res = await fetch("/api/submit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return (await res.json()) as Outcome;
+}
+
+export async function resetLedger(): Promise<{ chain: Chain }> {
+  const res = await fetch("/api/reset", { method: "POST" });
+  return (await res.json()) as { chain: Chain };
 }

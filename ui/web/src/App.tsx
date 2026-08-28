@@ -1,214 +1,172 @@
-import { useCallback, useReducer, useRef } from "react";
-import { openStream, type StreamEvent, type GateCheck } from "./api";
-import ConversationPanel from "./components/ConversationPanel";
-import GatePanel from "./components/GatePanel";
-import LedgerPanel from "./components/LedgerPanel";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  fetchCatalog,
+  resetLedger,
+  submitMandate,
+  type LedgerRow,
+  type Outcome,
+  type Product,
+} from "./api";
+import ComposePanel from "./components/ComposePanel";
+import MandateCertificate from "./components/MandateCertificate";
+import LedgerRoll from "./components/LedgerRoll";
 
-export interface ConversationLine {
-  role: "buyer" | "merchant" | "gate" | "system";
-  text: string;
-  actN: number | null;
+export interface CartLine {
+  sku: string;
+  qty: number;
 }
 
-export interface LedgerRow {
-  seq: number;
-  eventType: string;
-  entryHash: string;
-  prevHash: string;
-}
-
-export interface GateView {
-  cartLabel: string | null;
-  totalRupees: string | null;
-  limitRupees: string | null;
-  checks: GateCheck[];
-  passed: boolean | null;
-  reasonCode: string | null;
-  message: string | null;
-}
-
-export interface ChainView {
-  ok: boolean | null;
-  entriesChecked: number;
-  detail: string;
-}
-
-interface State {
-  status: "idle" | "running" | "done";
-  agentId: string | null;
-  ceiling: string | null;
-  actN: number | null;
-  actTitle: string | null;
-  conversation: ConversationLine[];
-  gate: GateView;
-  ledger: LedgerRow[];
-  chain: ChainView;
-}
-
-// The seven checks, in order — seeded "pending" at the start of every gate run.
-const SEVEN_CHECKS: { id: string; label: string }[] = [
-  { id: "a", label: "Signature & authority" },
-  { id: "b", label: "Intent not expired" },
-  { id: "c", label: "Within signed limit" },
-  { id: "d", label: "Cart matches quote" },
-  { id: "e", label: "Quote still fresh" },
-  { id: "f", label: "Nonce unused (no replay)" },
-  { id: "g", label: "Price unchanged" },
-];
-
-const emptyGate = (): GateView => ({
-  cartLabel: null,
-  totalRupees: null,
-  limitRupees: null,
-  checks: SEVEN_CHECKS.map((c) => ({ ...c, state: "pending" as const })),
-  passed: null,
-  reasonCode: null,
-  message: null,
-});
-
-const initialState: State = {
-  status: "idle",
-  agentId: null,
-  ceiling: null,
-  actN: null,
-  actTitle: null,
-  conversation: [],
-  gate: emptyGate(),
-  ledger: [],
-  chain: { ok: null, entriesChecked: 0, detail: "" },
-};
-
-type Action = { type: "reset" } | { type: "event"; event: StreamEvent };
-
-function reducer(state: State, action: Action): State {
-  if (action.type === "reset") {
-    return { ...initialState, gate: emptyGate(), status: "running" };
-  }
-  const e = action.event;
-  switch (e.type) {
-    case "run_begin":
-      return { ...state, agentId: e.agent_id, ceiling: e.ceiling_rupees };
-    case "act":
-      return {
-        ...state,
-        actN: e.n,
-        actTitle: e.title,
-        gate: emptyGate(), // fresh gauntlet each act
-      };
-    case "conversation":
-      return {
-        ...state,
-        conversation: [...state.conversation, { role: e.role, text: e.text, actN: state.actN }],
-      };
-    case "gate_begin":
-      return {
-        ...state,
-        gate: {
-          ...emptyGate(),
-          cartLabel: e.cart_label,
-          totalRupees: e.total_rupees,
-          limitRupees: e.limit_rupees,
-        },
-      };
-    case "gate_check":
-      return {
-        ...state,
-        gate: {
-          ...state.gate,
-          checks: state.gate.checks.map((c) => (c.id === e.id ? { ...c, state: e.state } : c)),
-        },
-      };
-    case "gate_result":
-      return {
-        ...state,
-        gate: {
-          ...state.gate,
-          passed: e.passed,
-          reasonCode: e.reason_code,
-          message: e.message,
-          totalRupees: e.total_rupees ?? state.gate.totalRupees,
-        },
-      };
-    case "ledger":
-      return {
-        ...state,
-        ledger: [
-          ...state.ledger,
-          { seq: e.seq, eventType: e.event_type, entryHash: e.entry_hash, prevHash: e.prev_hash },
-        ],
-      };
-    case "chain":
-      return { ...state, chain: { ok: e.ok, entriesChecked: e.entries_checked, detail: e.detail } };
-    case "run_end":
-      return {
-        ...state,
-        status: "done",
-        chain: { ok: e.chain_ok, entriesChecked: e.entries_checked, detail: e.detail },
-      };
-    case "stream_end":
-      return state.status === "running" ? { ...state, status: "done" } : state;
-    default:
-      return state;
-  }
-}
+const DEFAULT_CEILING = 600_000; // ₹6,000
 
 export default function App() {
-  const [state, dispatch] = useReducer(reducer, initialState);
-  const stopRef = useRef<null | (() => void)>(null);
+  const [catalog, setCatalog] = useState<Product[]>([]);
+  const [ceiling, setCeiling] = useState(DEFAULT_CEILING);
+  const [cart, setCart] = useState<CartLine[]>([{ sku: "NW-SHOE-001", qty: 1 }]);
+  const [attacks, setAttacks] = useState<string[]>([]);
+  const [result, setResult] = useState<Outcome | null>(null);
+  const [sealed, setSealed] = useState(false);
+  const [ledger, setLedger] = useState<LedgerRow[]>([]);
+  const [chainOk, setChainOk] = useState<boolean | null>(null);
+  const [chainRows, setChainRows] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [canReplay, setCanReplay] = useState(false);
+  const sealTimer = useRef<number | null>(null);
 
-  const run = useCallback(() => {
-    stopRef.current?.();
-    dispatch({ type: "reset" });
-    stopRef.current = openStream((event) => dispatch({ type: "event", event }));
+  useEffect(() => {
+    fetchCatalog().then(setCatalog).catch(() => setCatalog([]));
   }, []);
 
-  const chainOk = state.chain.ok;
+  // Editing the draft after a verdict makes that verdict stale — clear the stamp
+  // and return the certificate to a fresh, unstamped draft.
+  const clearVerdict = useCallback(() => {
+    setResult(null);
+    setSealed(false);
+    if (sealTimer.current) window.clearTimeout(sealTimer.current);
+  }, []);
+
+  const priceOf = useCallback(
+    (sku: string) => catalog.find((p) => p.sku === sku)?.price_paise ?? 0,
+    [catalog],
+  );
+  const subtotal = cart.reduce((sum, line) => sum + priceOf(line.sku) * line.qty, 0);
+
+  const addToCart = (sku: string) => {
+    clearVerdict();
+    setCart((prev) => {
+      const found = prev.find((l) => l.sku === sku);
+      if (found) return prev.map((l) => (l.sku === sku ? { ...l, qty: l.qty + 1 } : l));
+      return [...prev, { sku, qty: 1 }];
+    });
+  };
+  const setQty = (sku: string, qty: number) => {
+    clearVerdict();
+    setCart((prev) =>
+      qty <= 0 ? prev.filter((l) => l.sku !== sku) : prev.map((l) => (l.sku === sku ? { ...l, qty } : l)),
+    );
+  };
+  const toggleAttack = (name: string) => {
+    clearVerdict();
+    setAttacks((prev) => (prev.includes(name) ? prev.filter((a) => a !== name) : [...prev, name]));
+  };
+  const changeCeiling = (paise: number) => {
+    clearVerdict();
+    setCeiling(paise);
+  };
+
+  const runSubmit = async (replay = false) => {
+    if (busy) return;
+    setBusy(true);
+    setResult(null);
+    setSealed(false);
+    try {
+      const outcome = await submitMandate({
+        ceiling_paise: ceiling,
+        items: cart,
+        attacks,
+        replay,
+      });
+      if (outcome.error) {
+        setBusy(false);
+        setResult({ ...(outcome as Outcome) });
+        return;
+      }
+      setResult(outcome);
+      setLedger((prev) => [...prev, ...outcome.ledger]);
+      setChainOk(outcome.chain.ok);
+      setChainRows(outcome.chain.entries_checked);
+      if (outcome.passed) setCanReplay(true);
+      // Let the seven checks resolve, then land the stamp — the one hero beat.
+      const revealMs = 7 * 70 + 260;
+      sealTimer.current = window.setTimeout(() => setSealed(true), revealMs);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doReset = async () => {
+    clearVerdict();
+    setLedger([]);
+    setCanReplay(false);
+    const { chain } = await resetLedger();
+    setChainOk(chain.ok);
+    setChainRows(chain.entries_checked);
+  };
 
   return (
-    <div className="console">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">◆</span>
+    <div className="bench">
+      <header className="masthead">
+        <div className="mast-left">
+          <span className="mast-seal" aria-hidden>
+            ❦
+          </span>
           <div>
-            <div className="brand-name">NORTHWIND</div>
-            <div className="brand-sub">merchant-side gate · live console</div>
+            <h1 className="mast-title">Northwind</h1>
+            <p className="mast-sub">Mandate Authority Bench</p>
           </div>
         </div>
-
-        <div className="run-meta">
-          {state.agentId && (
-            <span className="meta-chip">
-              agent <b>{state.agentId}</b>
-            </span>
-          )}
-          {state.ceiling && (
-            <span className="meta-chip">
-              ceiling <b>{state.ceiling}</b>
-            </span>
-          )}
-          <span className={`chain-badge ${chainOk === null ? "idle" : chainOk ? "ok" : "broken"}`}>
-            {chainOk === null
-              ? "chain —"
-              : chainOk
-                ? `chain intact · ${state.chain.entriesChecked}`
-                : `chain BROKEN · ${state.chain.detail}`}
-          </span>
+        <p className="mast-note">
+          Compose a mandate the way an AI buyer would. The merchant&rsquo;s Gate — not the buyer&rsquo;s
+          good behaviour — decides whether it clears.
+        </p>
+        <div className={`mast-chain ${chainOk === null ? "" : chainOk ? "intact" : "broken"}`}>
+          <span className="mast-chain-dot" aria-hidden />
+          {chainOk === null
+            ? "ledger ready"
+            : chainOk
+              ? `ledger verified · ${chainRows} rows`
+              : "ledger tampered"}
         </div>
-
-        <button className="run-btn" onClick={run} disabled={state.status === "running"}>
-          {state.status === "running" ? "running…" : state.status === "done" ? "run again" : "run demo"}
-        </button>
       </header>
 
-      <main className="panels">
-        <ConversationPanel
-          lines={state.conversation}
-          actN={state.actN}
-          actTitle={state.actTitle}
-          status={state.status}
+      <main className="stage">
+        <ComposePanel
+          catalog={catalog}
+          ceiling={ceiling}
+          cart={cart}
+          attacks={attacks}
+          busy={busy}
+          canReplay={canReplay}
+          subtotal={subtotal}
+          onCeiling={changeCeiling}
+          onAdd={addToCart}
+          onQty={setQty}
+          onToggleAttack={toggleAttack}
+          onSubmit={() => runSubmit(false)}
+          onReplay={() => runSubmit(true)}
+          onReset={doReset}
         />
-        <GatePanel gate={state.gate} />
-        <LedgerPanel rows={state.ledger} chain={state.chain} />
+
+        <MandateCertificate
+          catalog={catalog}
+          cart={cart}
+          ceiling={ceiling}
+          subtotal={subtotal}
+          attacks={attacks}
+          result={result}
+          sealed={sealed}
+        />
+
+        <LedgerRoll ledger={ledger} chainOk={chainOk} chainRows={chainRows} />
       </main>
     </div>
   );

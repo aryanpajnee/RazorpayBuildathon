@@ -1,79 +1,73 @@
-"""FastAPI backend for the React live console.
+"""FastAPI backend for the Authority Bench (the React console).
 
-Two jobs, nothing more:
+Interactive, not a canned reel: the browser composes a Cart Mandate and posts
+it here, and this backend runs it through the REAL Gate (`ui.bench`) and returns
+what actually happened. It also serves the built React app so the whole thing
+runs from one process:
 
-  * `GET /api/stream` — run the real-money-path scenario (`ui.scenario`) and
-    push each event to the browser over Server-Sent Events, paced by
-    `config.UI_STREAM_STEP_SECONDS` so the gate checks and hash chain animate
-    at a watchable speed. The events are produced by driving the REAL Gate,
-    quote store and ledger — this endpoint adds no money logic, it only relays.
-  * serve the built React app (`ui/web/dist`) so the whole demo runs from one
-    process: `uv run uvicorn ui.server:app --port 8100`.
+    uv run uvicorn ui.server:app --port 8100
 
-Run the frontend in dev mode instead (hot reload) with `npm run dev` inside
-`ui/web`; Vite proxies `/api` here (see ui/web/vite.config.ts).
+Endpoints:
+    GET  /api/catalog   -> the footwear a person can add to a cart
+    POST /api/submit    -> run a composed mandate through the real Gate
+    POST /api/reset     -> start a fresh hash chain
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
-import config
-from ui.scenario import run_events
+from ui import bench
 
-app = FastAPI(title="Northwind Live Console")
+app = FastAPI(title="Northwind Authority Bench")
 
-# Dev convenience: the Vite dev server (a different origin) fetches the stream.
-# The console is a local demo tool, so any localhost origin is fine.
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
 _DIST = Path(__file__).parent / "web" / "dist"
 
 
-async def _event_source() -> "asyncio.AsyncIterator[str]":
-    """Yield the scenario as SSE frames, paced for the camera.
-
-    `run_events()` is a synchronous generator over the real money path; each
-    event is serialised as one `data:` frame. A small sleep between frames is
-    what makes the checks flip and the chain grow one step at a time on screen.
-    """
-    step = config.UI_STREAM_STEP_SECONDS
-    for event in run_events():
-        yield f"data: {json.dumps(event)}\n\n"
-        # Longer pause on the visually meaningful beats, a short one otherwise.
-        pause = step if event.get("type") in {"act", "gate_check", "gate_result", "ledger", "conversation"} else step / 5
-        await asyncio.sleep(pause)
-    yield 'data: {"type": "stream_end"}\n\n'
+class CartItem(BaseModel):
+    sku: str
+    qty: int = 1
 
 
-@app.get("/api/stream")
-async def stream() -> StreamingResponse:
-    return StreamingResponse(
-        _event_source(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+class SubmitBody(BaseModel):
+    ceiling_paise: int
+    items: list[CartItem] = []
+    attacks: list[str] = []
+    replay: bool = False
+
+
+@app.get("/api/catalog")
+def catalog() -> dict:
+    return {"products": bench.catalog()}
+
+
+@app.post("/api/submit")
+def submit(body: SubmitBody) -> dict:
+    return bench.submit(
+        ceiling_paise=body.ceiling_paise,
+        items=[item.model_dump() for item in body.items],
+        attacks=body.attacks,
+        replay=body.replay,
     )
+
+
+@app.post("/api/reset")
+def reset() -> dict:
+    return bench.reset()
 
 
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True, "dist_built": _DIST.exists()}
-
-
-# --- serve the built React app ----------------------------------------------
-# Mounted last so it never shadows /api/*. If the app hasn't been built yet,
-# say so plainly rather than 404-ing into a confusing blank page.
 
 
 @app.get("/")
