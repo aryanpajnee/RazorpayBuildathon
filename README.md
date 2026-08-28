@@ -10,7 +10,7 @@ bounded authority.
 > full money path — order creation, a checkout page, and webhook receipt — the
 > **autonomous buyer agent**, and the **merchant agent org** (storefront, semantic
 > search, sales/upsell, negotiation, substitution, refusal explainer) with real
-> agent-to-agent negotiation and LLM-driven recovery are built and tested (423
+> agent-to-agent negotiation and LLM-driven recovery are built and tested (425
 > tests, offline and deterministic). The live path is proven against test-mode
 > Razorpay: the merchant's own **sales agent upsells a cart past the user's signed
 > ceiling and the merchant's own Gate refuses it** (OVER_LIMIT), then the recovery
@@ -106,7 +106,7 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Razorpay test-mode 
 ```bash
 uv sync --extra dev
 cp .env.example .env   # then fill in your keys
-uv run pytest -q       # 423 tests, offline and deterministic
+uv run pytest -q       # 425 tests, offline and deterministic
 ```
 
 Note `--extra dev`: a bare `uv sync` omits pytest, and `uv run pytest` will then

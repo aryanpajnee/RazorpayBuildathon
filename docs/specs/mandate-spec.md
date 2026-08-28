@@ -82,7 +82,8 @@ once and never again.
 | `type` | `str` | `"intent"` |
 | `mandate_id` | `str` | unique, e.g. `man_int_<uuid4hex[:12]>` |
 | `user_id` | `str` | who is granting authority |
-| `agent_id` | `str` | who receives it |
+| `agent_id` | `str` | who receives it (a label) |
+| `agent_pubkey` | `str` | 64 hex chars — the agent's Ed25519 public key. The **proof** behind `agent_id`: the Gate rejects any cart signed by a different key (gate check (a)). Covered by the user's signature, so it cannot be swapped. Required. |
 | `category` | `str` | what may be bought, e.g. `"footwear"` |
 | `max_paise` | `int` | ceiling for a single purchase |
 | `max_purchases` | `int` | how many purchases this authorises |
@@ -211,6 +212,14 @@ public key (hex):
 ```
 
 ### Vector 1 — Intent Mandate
+
+These vectors were frozen before the implementation existed, as anchors for the
+**serializer** (`canonical`/`sign`/`verify`), and predate the `agent_pubkey`
+field added to the live intent schema in §3.1. They are intentionally left
+unchanged — their documented length, sha256 and signature must not move — so
+Vector 1 omits `agent_pubkey`. It still canonicalises and verifies; it is simply
+a payload of the original shape, which is exactly what a serializer anchor
+should be.
 
 Payload:
 ```json

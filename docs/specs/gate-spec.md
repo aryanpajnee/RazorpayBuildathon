@@ -127,10 +127,21 @@ Two things happen here, and both are authenticity, not permission:
    file, the chain of authority is broken and nothing past this point can be
    evaluated meaningfully — refuse.
 3. `cart.agent_id == intent.agent_id`. The cart is validly signed, but by
-   whom the intent named? A cart signed by a different agent key than the
-   one the user authorised is not a permission problem, it's an
-   impersonation problem — it belongs with authenticity, not with the
-   business-rule checks in (c).
+   whom the intent named? This compares the **label** only — a cart naming a
+   different agent than the intent authorises fails here with `AGENT_MISMATCH`.
+3b. `cart_envelope.public_key == intent.agent_pubkey`. This is the **proof**
+   behind the label. `verify()` (step 1) established the signature is valid
+   over the envelope's OWN embedded key — never that the key is entitled to
+   spend. The user bound the agent's trusted key into the intent they signed;
+   a cart whose `agent_id` matches but is signed by any *other* key is
+   impersonation, and it belongs with authenticity, not the business-rule
+   checks in (c). Refused **`SIG_INVALID`** — the document's signing key cannot
+   be trusted. (`intent.agent_pubkey` absent, e.g. a legacy pre-binding intent,
+   is treated as untrusted: nothing can match `None`, so the cart is refused.)
+   Without this step a valid signature over an attacker-generated key passes as
+   authorisation — the exact gap the `atk_agent_key_impersonation` red-team
+   finding proved, `verify()` alone not being authorisation (see
+   `core/mandate.py`).
 4. `cart.merchant_id == config.MERCHANT_ID`. Purely local, no lookup: is
    this cart even addressed to us? A cart naming a different merchant fails
    here regardless of anything else about it — there's no reason to spend a
@@ -531,6 +542,7 @@ cart, not just one proving it fires on a bad one.
 | (a) signature | `test_gate_passes_with_valid_signature` | `test_gate_refuses_forged_signature` | `SIG_INVALID` |
 | (a) intent resolution | `test_gate_passes_with_known_intent` | `test_gate_refuses_unknown_intent_mandate_id` | `INTENT_NOT_FOUND` |
 | (a) agent binding | `test_gate_passes_matching_agent` | `test_gate_refuses_agent_mismatch` | `AGENT_MISMATCH` |
+| (a) agent-key binding | `test_gate_passes_with_valid_signature` | `test_gate_refuses_wrong_key_right_agent_id` | `SIG_INVALID` |
 | (a) merchant binding | `test_gate_passes_matching_merchant` | `test_gate_refuses_wrong_merchant` | `WRONG_MERCHANT` |
 | (b) expiry | `test_gate_passes_unexpired_intent` | `test_gate_refuses_expired_intent` | `INTENT_EXPIRED` |
 | (c) max_paise | `test_gate_passes_under_limit` | `test_gate_refuses_over_limit` | `OVER_LIMIT` |
@@ -543,7 +555,7 @@ cart, not just one proving it fires on a bad one.
 | (f) nonce | `test_gate_passes_fresh_nonce` | `test_gate_refuses_replayed_nonce` | `NONCE_REUSED` |
 | (g) price | `test_gate_passes_unchanged_price` | `test_gate_refuses_price_drift` | `PRICE_DRIFT` |
 
-### The nine red-team attacks
+### The ten red-team attacks
 
 | Attack | Caught by | Test |
 |---|---|---|
@@ -552,7 +564,8 @@ cart, not just one proving it fires on a bad one.
 | Price drift | Check (g) | `test_gate_refuses_price_drift` — mutate the catalog's price for a sku between quoting and gating. |
 | Cart tamper | Check (d) | `test_gate_refuses_cart_tamper` — sign a cart mandate, then flip a qty or sku in the stored quote's line items before gating, so `cart_hash` no longer matches. |
 | Over-limit | Check (c) | `test_gate_refuses_over_limit` — quote a cart above `intent.max_paise`. |
-| Forged signature | Check (a) | `test_gate_refuses_forged_signature` — sign with a key that isn't the agent's, or flip a byte in the signature. |
+| Forged signature | Check (a) | `test_gate_refuses_forged_signature` — flip a byte in the signature so it no longer verifies over its own key. |
+| Agent-key impersonation | Check (a).3b | `test_gate_refuses_wrong_key_right_agent_id` — attacker signs a cart that correctly names the victim's `agent_id`, against the victim's intent, with a *different* keypair. The signature is internally valid, the `agent_id` matches; the signing key was never the one the user bound. Refused `SIG_INVALID`. (Red-team finding `atk_agent_key_impersonation`.) |
 | Expired intent | Check (b) | `test_gate_refuses_expired_intent` — `intent.expires_at` in the past. |
 | Payment failure | **Out of scope.** Happens downstream of a `gate.passed`, at the Razorpay call / webhook layer. The Gate's only obligation here is to have passed correctly beforehand; idempotency on a failed-and-retried payment is enforced by `quote_id`, tested in `tests/test_gateway.py` and `tests/test_webhooks.py`, not here. |
 | Ledger tamper | **Out of scope.** Chain-integrity verification is `core/ledger.py`'s job, tested in `tests/test_ledger.py`. The Gate only calls append; it never reads the chain back and has no way to detect a tampered *past* entry. |
@@ -634,7 +647,7 @@ of any kind. One function, one set of seven checks, every caller.
 - [ ] Every call to `check()` appends exactly one ledger event, pass or
       refuse, with no early-return path that skips it
 - [ ] No LLM import, call, or client anywhere in the file
-- [ ] All nine red-team attacks in §8 are each caught by a named test, or
+- [ ] All ten red-team attacks in §8 are each caught by a named test, or
       explicitly out of scope with the reason stated
 - [ ] The upsell-agent demo path calls the exact same `gate.check()` as the
       buyer checkout path — no identity parameter, no bypass

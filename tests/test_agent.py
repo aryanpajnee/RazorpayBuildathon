@@ -204,9 +204,10 @@ def make_confirm_payment(outcome: str):
 def make_signed_intent(
     *, category="footwear", max_paise=1000000, max_purchases=3, ttl_seconds=3600, agent_id="agent_test",
 ):
-    user_sk, _user_vk = generate_keypair()
+    user_sk, user_vk = generate_keypair()
     payload = make_intent_mandate(
-        user_id="user_test", agent_id=agent_id, category=category,
+        user_id="user_test", agent_id=agent_id, agent_pubkey=user_vk.encode().hex(),
+        category=category,
         max_paise=max_paise, max_purchases=max_purchases, ttl_seconds=ttl_seconds, merchant_id=None,
     )
     envelope = sign(payload, user_sk)

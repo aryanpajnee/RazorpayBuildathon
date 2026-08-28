@@ -189,13 +189,23 @@ def make_intent_mandate(
     *,
     user_id: str,
     agent_id: str,
+    agent_pubkey: str,
     category: str,
     max_paise: int,
     max_purchases: int,
     ttl_seconds: int,
     merchant_id: str | None = None,
 ) -> dict:
-    """Build an Intent Mandate payload. Does NOT sign - the user signs it."""
+    """Build an Intent Mandate payload. Does NOT sign - the user signs it.
+
+    `agent_pubkey` is the Ed25519 public key (64 hex chars) of the agent this
+    grant authorises to sign Cart Mandates. It is REQUIRED and rides inside the
+    payload, so the user's signature covers it: the Gate later checks a cart's
+    signing key against this bound key (`merchant/gate.py` check (a)). Making it
+    required is deliberate - a keyless intent could authorise nothing safely, so
+    it must be impossible to mint one. See the module docstring on why a valid
+    signature proves origin, not permission, and docs/design/agent-key-binding.md.
+    """
     _require_int(max_paise, "max_paise")
     _require_int(max_purchases, "max_purchases")
     _require_int(ttl_seconds, "ttl_seconds")
@@ -203,6 +213,14 @@ def make_intent_mandate(
         raise ValueError(f"max_paise must be positive, got {max_paise}")
     if max_purchases < 1:
         raise ValueError(f"max_purchases must be at least 1, got {max_purchases}")
+    if len(agent_pubkey) != PUBLIC_KEY_HEX_LEN:
+        raise ValueError(
+            f"agent_pubkey must be {PUBLIC_KEY_HEX_LEN} hex chars, got {len(agent_pubkey)}"
+        )
+    try:
+        bytes.fromhex(agent_pubkey)
+    except ValueError as exc:
+        raise ValueError(f"agent_pubkey must be valid hex: {exc}") from exc
 
     # Unix ints, not ISO strings. ISO carries timezone and formatting ambiguity
     # into the signed bytes; ints do not.
@@ -214,6 +232,7 @@ def make_intent_mandate(
         "mandate_id": f"man_int_{uuid.uuid4().hex[:12]}",
         "user_id": user_id,
         "agent_id": agent_id,
+        "agent_pubkey": agent_pubkey,
         "category": category,
         "max_paise": max_paise,
         "max_purchases": max_purchases,

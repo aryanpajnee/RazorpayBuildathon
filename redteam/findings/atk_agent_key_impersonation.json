@@ -1,0 +1,39 @@
+{
+  "id": "atk_agent_key_impersonation",
+  "title": "Agent-key impersonation: valid signature over an untrusted key authorised as spend",
+  "verdict": "BREACH",
+  "severity": "critical",
+  "status": "fixed",
+  "surface": "merchant/gate.py :: check() — check (a), agent binding",
+  "discovered_by": "autonomous red team (Phase 6)",
+  "discovered_at": "2026-08-28",
+  "cwe": ["CWE-287 Improper Authentication", "CWE-345 Insufficient Verification of Data Authenticity"],
+  "summary": "gate.check() proved a Cart Mandate's signature was valid over the envelope's OWN embedded public_key (core.mandate.verify) and then matched agent_id as a plain string against the intent. It never checked that the signing key was one the merchant trusts for that agent. Any attacker could generate a fresh Ed25519 keypair, self-serve a quote, build a cart claiming agent_id='agt_victim' against the victim's intent, sign it with their own key, and the Gate returned passed=True.",
+  "root_cause": "verify() proves origin (this payload was signed by the holder of THIS key), not permission (this key is entitled to spend for this agent). The intent carried no trusted agent key to compare against, and check (a) compared only the agent_id string. core/mandate.py's module docstring warned about exactly this: 'The Gate must therefore check the embedded public key against a key it already trusts... verify() alone is not authorisation.'",
+  "reproduction": {
+    "offline": true,
+    "steps": [
+      "Register an intent for agent_id 'agt_victim' with a comfortable max_paise.",
+      "As attacker, generate a DIFFERENT Ed25519 keypair.",
+      "Self-serve a quote via the merchant quote path.",
+      "Build a Cart Mandate: agent_id='agt_victim', against the victim's intent_mandate_id, over the attacker's quote.",
+      "Sign it with the ATTACKER's key.",
+      "Call merchant.gate.check(envelope)."
+    ],
+    "observed_before_fix": "passed=True, reason_code=null — 589,882 paise authorised on a key the merchant never trusted for 'agt_victim'.",
+    "observed_after_fix": "passed=False, reason_code='SIG_INVALID' — the untrusted signing key is rejected.",
+    "regression_test": "tests/test_gate.py::test_gate_refuses_wrong_key_right_agent_id"
+  },
+  "fix": {
+    "decision": "Option A — bind the agent's trusted Ed25519 public key at intent grant.",
+    "design_doc": "docs/design/agent-key-binding.md",
+    "changes": [
+      "core/mandate.make_intent_mandate: new REQUIRED agent_pubkey field, covered by the user's signature.",
+      "merchant/gate.check(): new check (a).3b — cart_envelope['public_key'] must equal intent['agent_pubkey'], else refuse SIG_INVALID (fails safe when absent).",
+      "buyer/intent_compiler.draft_intent + readback: thread and display the bound agent key.",
+      "Specs updated: gate-spec §(a)/§8, mandate-spec §3.1. The closed 14-code set in gate-spec §4 is UNCHANGED — SIG_INVALID reused, no new code."
+    ],
+    "reason_code": "SIG_INVALID",
+    "spec_change": false
+  }
+}

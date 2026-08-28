@@ -264,6 +264,24 @@ def check(cart_envelope: dict, *, now: int | None = None) -> GateResult:
             {"cart_agent_id": payload["agent_id"], "intent_agent_id": intent["agent_id"]},
         )
 
+    # --- (a) agent KEY binding --------------------------------------------
+    # The agent_id above is a label; this is the proof. `verify()` established
+    # the signature is valid over the envelope's OWN embedded public_key — NOT
+    # that the key belongs to anyone entitled to spend (see core/mandate.py's
+    # module docstring). The user bound the agent's trusted key into the intent
+    # they signed; a cart signed by any other key, however well it name-drops
+    # the right agent_id, is impersonation. Refused SIG_INVALID — the document's
+    # signing key cannot be trusted (gate-spec check (a); the closed §4 code set
+    # is unchanged). `.get` fails safe: a legacy intent with no bound key yields
+    # None, and a 64-hex envelope key never equals None, so it is refused too.
+    if cart_envelope["public_key"] != intent.get("agent_pubkey"):
+        return _refuse(
+            ctx,
+            SIG_INVALID,
+            "cart mandate signed by a key not bound to this agent in the intent",
+            {"cart_public_key": cart_envelope["public_key"]},
+        )
+
     # --- (a) merchant binding ----------------------------------------------
     if payload["merchant_id"] != config.MERCHANT_ID:
         return _refuse(

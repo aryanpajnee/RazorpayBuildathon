@@ -244,16 +244,32 @@ def test_verify_rejects_something_that_is_not_an_envelope():
 
 def test_an_intent_mandate_has_every_field_the_spec_lists():
     payload = make_intent_mandate(
-        user_id="usr_aryan", agent_id="agt_x", category="footwear",
+        user_id="usr_aryan", agent_id="agt_x", agent_pubkey="ab" * 32,
+        category="footwear",
         max_paise=500000, max_purchases=1, ttl_seconds=3600,
     )
     assert set(payload) == {
-        "version", "type", "mandate_id", "user_id", "agent_id", "category",
-        "max_paise", "max_purchases", "currency", "issued_at", "expires_at",
-        "merchant_id",
+        "version", "type", "mandate_id", "user_id", "agent_id", "agent_pubkey",
+        "category", "max_paise", "max_purchases", "currency", "issued_at",
+        "expires_at", "merchant_id",
     }
     assert payload["type"] == "intent"
     assert payload["merchant_id"] is None  # None means any merchant
+
+
+def test_intent_mandate_rejects_a_malformed_agent_pubkey():
+    """The bound agent key is what the Gate later trusts; a wrong-length or
+    non-hex key must fail at construction, not silently at gate time."""
+    with pytest.raises(ValueError):
+        make_intent_mandate(
+            user_id="u", agent_id="a", agent_pubkey="tooshort",
+            category="footwear", max_paise=1, max_purchases=1, ttl_seconds=90,
+        )
+    with pytest.raises(ValueError):
+        make_intent_mandate(
+            user_id="u", agent_id="a", agent_pubkey="zz" * 32,  # 64 chars, not hex
+            category="footwear", max_paise=1, max_purchases=1, ttl_seconds=90,
+        )
 
 
 def test_a_cart_mandate_has_every_field_the_spec_lists():
@@ -273,7 +289,7 @@ def test_a_cart_mandate_has_every_field_the_spec_lists():
 def test_timestamps_are_unix_ints_not_iso_strings():
     """ISO strings carry timezone and formatting ambiguity into signed bytes."""
     payload = make_intent_mandate(
-        user_id="u", agent_id="a", category="footwear",
+        user_id="u", agent_id="a", agent_pubkey="ab" * 32, category="footwear",
         max_paise=1, max_purchases=1, ttl_seconds=90,
     )
     assert type(payload["issued_at"]) is int
@@ -295,7 +311,7 @@ def test_two_cart_mandates_never_share_a_nonce():
 def test_a_float_amount_is_refused_at_construction():
     with pytest.raises(TypeError):
         make_intent_mandate(
-            user_id="u", agent_id="a", category="footwear",
+            user_id="u", agent_id="a", agent_pubkey="ab" * 32, category="footwear",
             max_paise=5000.0, max_purchases=1, ttl_seconds=90,
         )
 
@@ -303,7 +319,7 @@ def test_a_float_amount_is_refused_at_construction():
 def test_a_bool_is_not_an_acceptable_purchase_count():
     with pytest.raises(TypeError):
         make_intent_mandate(
-            user_id="u", agent_id="a", category="footwear",
+            user_id="u", agent_id="a", agent_pubkey="ab" * 32, category="footwear",
             max_paise=5000, max_purchases=True, ttl_seconds=90,
         )
 
@@ -348,7 +364,8 @@ def test_a_key_saved_on_disk_can_sign_something_that_verifies(tmp_path, monkeypa
     sk, _ = generate_keypair()
     save_keypair(sk, "usr_aryan")
     payload = make_intent_mandate(
-        user_id="usr_aryan", agent_id="agt_x", category="footwear",
+        user_id="usr_aryan", agent_id="agt_x", agent_pubkey="ab" * 32,
+        category="footwear",
         max_paise=500000, max_purchases=1, ttl_seconds=3600,
     )
     assert verify(sign(payload, load_signing_key("usr_aryan"))) == payload

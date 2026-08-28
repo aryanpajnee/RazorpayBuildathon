@@ -5,6 +5,44 @@ they read first, so it's written as things break — not reconstructed afterward
 
 ---
 
+## 2026-08-28 — Our own red team walked straight through the Gate.
+
+**What broke.** The Gate is the centrepiece — the single door between a signed
+Cart Mandate and money. The Phase 6 autonomous red team found a real hole in it.
+`gate.check()` verified a cart's signature and then matched `agent_id` as a plain
+**string** against the intent. But `core.mandate.verify()` only proves a payload
+was signed by the holder of *the key embedded in that same envelope* — not that
+the key belongs to anyone entitled to spend. So an attacker could generate their
+own Ed25519 keypair, build a cart claiming `agent_id="agt_victim"` against the
+victim's intent, sign it with their **own** key, and the Gate returned
+`passed=True`. Reproduced offline against the real `check()`: 589,882 paise
+authorised on a key the merchant had never trusted for that agent. The sting is
+that `core/mandate.py`'s own module docstring had *warned* about this exact gap —
+"verify() alone is not authorisation" — and the Gate did it anyway.
+
+**How I got out.** Fixed rather than documented. The user is the root of trust,
+so the user now binds the agent's public key *inside the intent they sign*
+(`make_intent_mandate` gained a required `agent_pubkey`, covered by the user's
+signature so it can't be swapped). The Gate gained one check inside (a): the
+cart's signing key must equal the key the intent bound for that agent, else
+`SIG_INVALID`. The closed 14-code set didn't need a new code — an untrusted
+signing key *is* a signature-authority failure. Wrote the reproduction as a
+permanent regression test (`test_gate_refuses_wrong_key_right_agent_id`) and a
+design walkthrough (`docs/design/agent-key-binding.md`); full suite green at 425.
+
+**What I'd tell the next person.** A valid signature answers "who signed this?",
+never "may they spend?". If your authorisation check compares an *identifier* the
+document asserts about itself (`agent_id`) instead of the *key* that signed it,
+you have string-matched your way around the crypto. Bind the trusted key at grant
+time and compare against that. And — write the adversarial test for
+wrong-key-right-identity, not just flip-a-signature-byte; the original suite only
+had the latter, which is why this survived.
+
+**Cost:** ~1 focused session, caught by our own tooling before submission — which
+is the point of building an autonomous red team in the first place.
+
+---
+
 ## 2026-08-25 — Razorpay's docs say test mode needs no KYC. The dashboard disagrees.
 
 **What broke.** Razorpay's documentation is explicit that Test Mode requires no

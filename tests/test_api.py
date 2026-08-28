@@ -42,12 +42,13 @@ def _grant_intent_and_sign_cart(client, *, max_paise: int, quote_data: dict):
 
     Returns (envelope, intent_payload) so callers can inspect either.
     """
-    sk, _vk = generate_keypair()
+    sk, vk = generate_keypair()
     agent_id = f"agent_test_{sk.verify_key.encode().hex()[:8]}"
 
     intent_payload = make_intent_mandate(
         user_id="user_test",
         agent_id=agent_id,
+        agent_pubkey=vk.encode().hex(),
         category="footwear",
         max_paise=max_paise,
         max_purchases=5,

@@ -122,6 +122,7 @@ def make_valid_case(
     intent = make_intent_mandate(
         user_id="u1",
         agent_id=agent_id,
+        agent_pubkey=vk.encode().hex(),
         category=category,
         max_paise=max_paise,
         max_purchases=max_purchases,
@@ -275,6 +276,31 @@ def test_gate_refuses_forged_signature():
     tampered["signature"] = flip_hex_char(tampered["signature"])
 
     result = check(tampered, now=case["quote"].issued_at + 1)
+    assert_refused(result, "SIG_INVALID")
+
+
+def test_gate_refuses_wrong_key_right_agent_id():
+    """Red-team atk_agent_key_impersonation: an attacker with a DIFFERENT
+    keypair signs a cart that correctly names the victim's agent_id, against
+    the victim's intent. The signature is internally valid over the attacker's
+    own key — the string agent_id matches — but the key was never the one the
+    user bound into the intent. The Gate must refuse SIG_INVALID, not pass.
+
+    A plain `verify()` would accept this envelope; authorisation is what
+    rejects it. Guards check (a)'s agent-key binding
+    (docs/design/agent-key-binding.md).
+    """
+    case = make_valid_case()  # intent bound to case["vk"]; carts signed by case["sk"]
+
+    attacker_sk, attacker_vk = generate_keypair()
+    assert attacker_vk.encode() != case["vk"].encode()
+
+    # Same agent_id, same intent, same quote — only the signing key is wrong.
+    envelope = build_cart_envelope(case, case["quote"], sk=attacker_sk)
+    assert envelope["public_key"] == attacker_vk.encode().hex()
+    assert envelope["payload"]["agent_id"] == case["agent_id"]
+
+    result = check(envelope, now=case["quote"].issued_at + 1)
     assert_refused(result, "SIG_INVALID")
 
 

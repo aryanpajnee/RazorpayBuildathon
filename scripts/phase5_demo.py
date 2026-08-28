@@ -96,7 +96,8 @@ def run(base_url: str, *, max_rupees: int) -> None:
     sk, vk = generate_keypair()
     agent_id = f"agent_demo_{vk.encode().hex()[:8]}"
     intent_payload = make_intent_mandate(
-        user_id="user_demo", agent_id=agent_id, category="footwear",
+        user_id="user_demo", agent_id=agent_id, agent_pubkey=vk.encode().hex(),
+        category="footwear",
         max_paise=max_paise, max_purchases=5, ttl_seconds=3600,
     )
     intent_store.register_intent(intent_payload)

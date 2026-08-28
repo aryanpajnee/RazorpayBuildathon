@@ -318,7 +318,7 @@ def test_draft_intent_converts_rupees_to_paise_in_python(monkeypatch):
             "ttl_hours": 24,
         }),
     )
-    payload = intent_compiler.draft_intent("get me running shoes under ₹5000")
+    payload = intent_compiler.draft_intent("get me running shoes under ₹5000", agent_pubkey="ab" * 32)
     assert payload["max_paise"] == 500000
     assert payload["category"] == "footwear"
     assert payload["max_purchases"] == 1
@@ -334,7 +334,7 @@ def test_draft_intent_maps_phrase_category_to_merchant_vocabulary(monkeypatch):
         "buyer.intent_compiler.llm.invoke",
         fake_invoke({"category": "Footwear", "max_rupees": 5000, "max_purchases": 1, "ttl_hours": 24}),
     )
-    payload = intent_compiler.draft_intent("get me running shoes under 5000")
+    payload = intent_compiler.draft_intent("get me running shoes under 5000", agent_pubkey="ab" * 32)
     assert payload["category"] == "footwear"
     assert payload["category"] in config.CATALOG_CATEGORIES
 
@@ -345,13 +345,13 @@ def test_draft_intent_rejects_category_outside_merchant_vocabulary(monkeypatch):
         fake_invoke({"category": "running shoes", "max_rupees": 5000, "max_purchases": 1, "ttl_hours": 24}),
     )
     with pytest.raises(NodeError):
-        intent_compiler.draft_intent("get me running shoes under 5000")
+        intent_compiler.draft_intent("get me running shoes under 5000", agent_pubkey="ab" * 32)
 
 
 def test_draft_intent_raises_on_malformed_response(monkeypatch):
     monkeypatch.setattr("buyer.intent_compiler.llm.invoke", fake_invoke("nonsense, not json"))
     with pytest.raises(NodeError):
-        intent_compiler.draft_intent("get me shoes")
+        intent_compiler.draft_intent("get me shoes", agent_pubkey="ab" * 32)
 
 
 @pytest.mark.parametrize(
@@ -378,7 +378,7 @@ def test_draft_intent_rejects_non_positive_int_rupees(monkeypatch, bad_rupees):
         }),
     )
     with pytest.raises(NodeError):
-        intent_compiler.draft_intent("get me running shoes")
+        intent_compiler.draft_intent("get me running shoes", agent_pubkey="ab" * 32)
 
 
 def test_readback_contains_exact_rupee_ceiling(monkeypatch):
@@ -391,7 +391,7 @@ def test_readback_contains_exact_rupee_ceiling(monkeypatch):
             "ttl_hours": 24,
         }),
     )
-    payload = intent_compiler.draft_intent("get me running shoes under ₹5000")
+    payload = intent_compiler.draft_intent("get me running shoes under ₹5000", agent_pubkey="ab" * 32)
     text = intent_compiler.readback(payload)
     assert "₹5,000.00" in text
     assert "footwear" in text

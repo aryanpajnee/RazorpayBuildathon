@@ -87,6 +87,7 @@ def run(base_url: str, *, max_paise: int, wait: bool, poll_seconds: int) -> None
     intent_payload = make_intent_mandate(
         user_id="user_happy_path",
         agent_id=agent_id,
+        agent_pubkey=vk.encode().hex(),
         category="footwear",
         max_paise=max_paise,
         max_purchases=5,

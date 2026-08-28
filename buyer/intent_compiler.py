@@ -65,7 +65,9 @@ _CONFIRMATION_TOKENS = frozenset({
 })
 
 
-def draft_intent(sentence: str, *, agent_id: str = "agent_buyer") -> dict:
+def draft_intent(
+    sentence: str, *, agent_id: str = "agent_buyer", agent_pubkey: str
+) -> dict:
     """Extract an Intent Mandate payload from `sentence`. Does NOT sign.
 
     One `llm.invoke` call extracts category/rupees/purchases/ttl from the
@@ -73,6 +75,11 @@ def draft_intent(sentence: str, *, agent_id: str = "agent_buyer") -> dict:
     (`config.PAISE_PER_RUPEE`) and builds the unsigned payload via
     `core.mandate.make_intent_mandate`. The model never sees or returns a
     paise value.
+
+    `agent_pubkey` is the public half of the agent's Cart-Mandate-signing key
+    (the caller holds the private half). It is bound into the grant the user
+    signs so the Gate can later reject a cart signed by any other key — the
+    model is nowhere near it.
     """
     response = llm.invoke(
         [("system", _SYSTEM_PROMPT), ("human", sentence)],
@@ -111,6 +118,7 @@ def draft_intent(sentence: str, *, agent_id: str = "agent_buyer") -> dict:
     return make_intent_mandate(
         user_id="user_local",
         agent_id=agent_id,
+        agent_pubkey=agent_pubkey,
         category=category,
         max_paise=max_rupees * config.PAISE_PER_RUPEE,
         max_purchases=max_purchases,
@@ -157,6 +165,7 @@ def readback(payload: dict) -> str:
         f"Expires in: {ttl}\n"
         f"Merchant: {merchant}\n"
         f"Agent: {payload['agent_id']}\n"
+        f"Agent key: {payload['agent_pubkey']}\n"
         "Reply 'confirm' to sign this authorization, or anything else to cancel."
     )
 
