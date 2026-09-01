@@ -13,7 +13,7 @@ bounded authority.
 > explainer), the **red team** (autonomous attacker, prompt-injection injector,
 > deterministic attack judge), the **observability agents** (ledger auditor,
 > merchant-value metrics), an **MCP server** that lets any MCP client shop the
-> merchant, and a **React live console** are all built and tested (**518 tests,
+> merchant, and a **React live console** are all built and tested (**580 tests,
 > offline and deterministic**). **All 17 agent surfaces are built.** The live path
 > is proven against test-mode Razorpay: the merchant's own **sales agent upsells a
 > cart past the user's signed ceiling and the merchant's own Gate refuses it**
@@ -32,6 +32,8 @@ bounded authority.
 > enforced mandate. A new dashboard streams every agent step, tool call, web
 > result, Gate check, and ledger row as it happens. The frozen money path above is
 > unchanged; this work is additive.
+>
+> **Day 1 (1 Sep) landed:** the web-discovery search chain (Serper→Tavily→DuckDuckGo) and the merchant offer layer (`POST /offer`) are in, and a live web find is proven to pass the real **Gate** end to end — web find → merchant offer → quote → signed mandate → Gate PASS (`scripts/day1_offer_proof.py`).
 
 ## The idea
 
@@ -131,7 +133,7 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Razorpay test-mode 
 ```bash
 uv sync --extra dev
 cp .env.example .env   # then fill in your keys
-uv run pytest -q       # 518 tests, offline and deterministic
+uv run pytest -q       # 580 tests, offline and deterministic
 ```
 
 Note `--extra dev`: a bare `uv sync` omits pytest, and `uv run pytest` will then

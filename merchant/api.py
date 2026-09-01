@@ -6,6 +6,8 @@ vault-code module that already enforces its own rules:
     GET  /catalog/search  -> merchant.catalog.all_products (plain filter)
     POST /quote            -> merchant.catalog.resolve_lines + merchant.quote.create_quote
                                + merchant.quote_store.save_quote + core.ledger.append
+    POST /offer             -> merchant.offers.create_offer (relist a web find),
+                               then the identical /quote recipe above
     POST /checkout          -> merchant.gate.check  (the one chokepoint before money),
                                then, only on a pass, merchant.gateway.create_order
     GET  /pay/{order_id}    -> merchant.checkout_page.render_checkout_page (the one
@@ -37,11 +39,11 @@ import json
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 
 import config
 from core.ledger import all_entries, append
-from merchant import catalog, gateway, webhooks
+from merchant import catalog, gateway, offers, webhooks
 from merchant.agents import refusal_explainer, sales, storefront, substitution
 from merchant.agents import catalog as catalog_agent
 from merchant.agents import negotiator as merchant_negotiator
@@ -68,6 +70,25 @@ class QuoteRequest(BaseModel):
 
 class CheckoutRequest(BaseModel):
     cart_envelope: dict
+
+
+class OfferRequest(BaseModel):
+    """A web find, on its way to becoming a merchant offer + quote.
+
+    `price_paise` and `qty` are `StrictInt`: pydantic v2's strict-mode int
+    coercion rejects bool and float at the request boundary (422) rather than
+    silently truncating `1999.0` -> `1999` or accepting `True` as `1` -- the
+    same "no floats touch a monetary value" discipline `offers.create_offer`
+    and `merchant/quote.py` enforce with `type(x) is int`, just applied one
+    layer earlier so a malformed request never even reaches that code.
+    """
+
+    title: str
+    url: str | None = None
+    price_paise: StrictInt
+    category: str | None = None
+    source: str = "external"
+    qty: StrictInt = 1
 
 
 # --- merchant agent-org request bodies (surfaces #1-#6) ----------------------
@@ -173,6 +194,99 @@ def post_quote(body: QuoteRequest) -> dict:
         },
     )
     return quote.as_dict()
+
+
+# --- offer (relist a web find, then quote it) --------------------------------
+
+
+@app.post("/offer")
+def post_offer(body: OfferRequest) -> dict:
+    """Relist a web find as a real Northwind product and quote it in one call.
+
+    This is the seam the canonical flow names as "Merchant Offer/Catalog":
+    everything upstream (a buyer's web search) is untrusted reasoning data;
+    `offers.create_offer` is where the merchant takes ownership of the price
+    and the category, and from there this route reuses the exact same
+    resolve_lines -> create_quote -> save_quote -> ledger recipe `/quote`
+    uses, so a relisted find is quoted through the identical, already-tested
+    path -- no second quoting code path to keep in sync.
+    """
+    category = body.category or offers.map_to_category(body.title)
+    if not category:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "uncategorised_offer",
+                "message": "could not map this find to a merchant category",
+                "title": body.title,
+            },
+        )
+
+    try:
+        offer = offers.create_offer(
+            title=body.title,
+            url=body.url,
+            price_paise=body.price_paise,
+            category=category,
+            source=body.source,
+        )
+    except offers.OfferError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "offer_rejected", "message": str(exc)},
+        ) from exc
+
+    try:
+        lines = resolve_lines([{"sku": offer.sku, "qty": body.qty}])
+        quote = create_quote(lines)
+    except catalog.ProductNotFound as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "product_not_found", "message": str(exc)},
+        ) from exc
+    except catalog.OutOfStock as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "out_of_stock", "message": str(exc)},
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_request", "message": str(exc)},
+        ) from exc
+
+    save_quote(quote)
+    # NOTE: the spec for this route also asked for an `offer.listed` ledger
+    # entry here, before `quote.issued`, for observability. core/ledger.py is
+    # FROZEN and its VALID_EVENT_TYPES is a closed frozenset that does not
+    # include "offer.listed" -- append() raises UnknownEventType for any
+    # event_type outside it. Registering a new event type would mean editing
+    # core/ledger.py, which is off-limits for this change. Rather than work
+    # around that (e.g. swallowing the exception, or misusing an existing
+    # event type), this route only appends the one event the ledger already
+    # recognises: quote.issued, identical to what /quote appends. See the
+    # PR/task notes for this gap -- a future ledger-schema change is the
+    # correct place to add "offer.listed".
+    append(
+        "quote.issued",
+        {
+            "quote_id": quote.quote_id,
+            "cart_hash": quote.cart_hash,
+            "total_paise": quote.total_paise,
+            "expires_at": quote.expires_at,
+        },
+    )
+    return {
+        **quote.as_dict(),
+        "offer": {
+            "sku": offer.sku,
+            "name": offer.name,
+            "category": offer.category,
+            "source": offer.source,
+            "url": offer.url,
+            "unit_paise": offer.unit_paise,
+        },
+    }
 
 
 # --- checkout ----------------------------------------------------------------

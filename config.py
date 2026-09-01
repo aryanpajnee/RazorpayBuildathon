@@ -93,6 +93,38 @@ GEMINI_DAILY_LIMIT = 1500
 LLM_MAX_ATTEMPTS = 4
 LLM_RETRY_BACKOFF_BASE_SECONDS = 1.0
 
+# --- Web search (Day 1: the buyer's discovery lane) ------------------------
+# The autonomous buyer discovers products on the open web before anything is
+# quoted. Search is READ-ONLY: it returns candidate data (title/url/price/
+# retailer) that is only ever reasoning input to the LLM. The merchant re-prices
+# every find itself (merchant/offers.py), so a scraped price is never authority.
+#
+# Fallback order: Serper, then Tavily, then DuckDuckGo. A provider is skipped on
+# ANY failure — missing key, non-200, timeout, or zero results — and the next one
+# is tried, so a quota or an outage degrades the run instead of killing it.
+# DuckDuckGo is keyless, so the chain always has a last resort that cannot run
+# out of credits.
+#
+# Serper leads DELIBERATELY, a considered deviation from the order CLAUDE.md's
+# "Web search rules" first sketched (Tavily-first). A live comparison (1 Sep) was
+# decisive for a SHOPPING agent: Serper's /shopping endpoint returns clean
+# structured ₹ prices AND the retailer name (Amazon.in, Flipkart, Decathlon, …),
+# so the buyer reasons over real buyable products; Tavily-first returned mostly
+# blog/forum pages with no price (1 of 5 buyable on the same query). Tavily stays
+# second as the broad-web backstop, DuckDuckGo third as the keyless resort.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
+
+SEARCH_PROVIDER_ORDER = ("serper", "tavily", "duckduckgo")
+SEARCH_MAX_RESULTS = 8               # cap results handed to the agent per query
+SEARCH_TIMEOUT_SECONDS = 8.0         # per-provider HTTP timeout; on hit -> next provider
+SEARCH_REGION = "in"                 # Serper gl= : bias results to India
+SEARCH_LANG = "en"                   # Serper hl=
+
+TAVILY_ENDPOINT = "https://api.tavily.com/search"
+SERPER_SHOPPING_ENDPOINT = "https://google.serper.dev/shopping"
+DUCKDUCKGO_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
+
 # --- Razorpay --------------------------------------------------------------
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
@@ -202,3 +234,35 @@ METRICS_DIR = DATA_DIR / "metrics"       # where #17 writes its computed tables
 # to; the Vite dev server proxies to it.
 UI_HOST = "127.0.0.1"
 UI_PORT = 8100
+
+# --- External offers (Day 1) ------------------------------------------------
+# The buyer discovers products on the open web (demo/search.py); before one can
+# be quoted, it must become a real, Gate-passable MERCHANT product — Northwind
+# "relists" the web find as an offer. merchant/offers.py is the one place that
+# turns a (title, url, price, category) tuple into something catalog.get_product
+# can resolve. See that module's docstring for the in-memory registration
+# mechanism and why it does not write to data/catalog.json.
+OFFER_SKU_PREFIX = "NW-EXT-"
+OFFER_DEFAULT_STOCK = 100
+OFFER_MARGIN_BPS = 0   # merchant margin over the sourced price, in basis points;
+                        # 0 = relist at the sourced price. The merchant still
+                        # owns this number — it is never the web's price verbatim.
+OFFER_SOURCE_TAG = "external_offer"
+
+# Deterministic (no-LLM) keyword routing from a free-text web-find title into
+# one of CATALOG_CATEGORIES, so the Gate's exact-string category check still
+# holds for a product nobody hand-catalogued. Every key here MUST be one of
+# CATALOG_CATEGORIES; map_to_category() in merchant/offers.py walks
+# CATALOG_CATEGORIES in order and returns the first category whose keyword
+# tuple matches, so a title with two plausible categories resolves to whichever
+# comes first in CATALOG_CATEGORIES, not whichever key happens to iterate first
+# in this dict.
+CATEGORY_KEYWORDS = {
+    "footwear": ("shoe", "sneaker", "trainer", "cleat", "boot"),
+    "socks": ("sock",),
+    "apparel": ("shirt", "tshirt", "t-shirt", "shorts", "jacket", "legging", "hoodie", "tights"),
+    "accessories": ("cap", "hat", "bottle", "bag", "watch", "glove", "band", "belt"),
+    "nutrition": ("protein", "gel", "energy", "electrolyte", "supplement", "bar", "hydration"),
+    "recovery": ("roller", "massage", "recovery", "compression", "ice"),
+    "bundle": ("bundle", "combo", "kit", "pack"),
+}
