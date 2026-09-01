@@ -23,6 +23,15 @@ bounded authority.
 > The one remaining human step is the successful **capture** (paying a created
 > order — UPI `success@razorpay` clears it; the generic `4111…` card reads as
 > international on test accounts).
+>
+> **In active build (1–4 Sep): the autonomous web buyer + a live mission-control
+> console.** The buyer becomes a real LLM tool-calling agent that takes a typed
+> request and a budget cap, **searches the live web** for matching products at
+> real prices, and settles the chosen purchase through this merchant + Gate +
+> Razorpay — the merchant-of-record pattern, so every rupee still clears a signed,
+> enforced mandate. A new dashboard streams every agent step, tool call, web
+> result, Gate check, and ledger row as it happens. The frozen money path above is
+> unchanged; this work is additive.
 
 ## The idea
 
@@ -34,6 +43,12 @@ This puts the authority in a cryptographic object the agent must present, and
 enforces it **on the merchant side** — not in the agent's good behaviour. The
 merchant re-verifies every signature, re-derives the cart hash, checks the quote
 hasn't expired, and refuses any payment its mandate doesn't cover.
+
+The buyer is free to shop the whole internet: it takes a plain request and a
+budget cap, searches the live web for real products at real prices, and picks the
+best fit. But it cannot pay anywhere it likes — the purchase settles through this
+merchant, which relists the chosen item and holds the transaction to the signed,
+budget-bounded mandate. Discovery is open; **authority is enforced at one door.**
 
 ## Two rules the code follows
 

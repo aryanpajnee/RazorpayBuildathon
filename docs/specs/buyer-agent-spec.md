@@ -1,5 +1,12 @@
 # Spec — `buyer/agent.py`
 
+> **NOTE (1 Sep):** This executor remains built, tested, and correct — it is now
+> the **deterministic reference buyer**. The live demo path is a separate real
+> LLM tool-calling agent (`demo/agent.py`) that discovers products on the open web
+> and settles through the same merchant, quote, Gate, and Razorpay path this spec
+> uses. Nothing here changes; the two share the frozen money path and this file's
+> prompts are reused inside the new tools.
+
 > **STATUS: IMPLEMENTED (Phase 4, 27 Aug).** `buyer/agent.py` is built to this
 > spec and proven live. Deviations, all deliberate and documented: (1) #11
 > Negotiator and #12 Recovery are deterministic stubs, not LLM nodes yet — COMMIT

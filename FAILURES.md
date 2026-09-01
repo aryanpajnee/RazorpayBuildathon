@@ -5,6 +5,39 @@ they read first, so it's written as things break — not reconstructed afterward
 
 ---
 
+## 2026-09-01 — The demo UI showed a form, not the agents.
+
+**What broke.** Sitting down to rehearse the submission, I opened the Phase 7
+React console — the "Authority Bench" — and it was the wrong artifact. It was a
+Gate test harness with a certificate skin: *I* clicked the spending ceiling, *I*
+clicked the cart from a catalog frozen to a single hardcoded `footwear` scope, and
+*I* ticked three pre-baked "attack" checkboxes. The one thing it never showed was
+the AI agents doing anything — no planning, no discovery, no evaluation, no
+negotiation, no recovery. For a submission whose entire thesis is agentic
+commerce, the demo made a human do the agent's job. Worse, the demo *scripts*
+propping up the story leaned on `if the model returned nothing: use a default
+cart` fallbacks — so even the "live" path was quietly faking the judgment it
+claimed to prove. The backend was genuinely strong (real Gate, real mandates, 518
+green tests); the thing a viewer would actually see was hollow.
+
+**How I got out.** Rather than polish the harness, I pivoted the demo layer (the
+money path stays frozen — it's what works). The buyer becomes a real LLM
+**tool-calling agent** that takes a typed request and a budget cap, **searches the
+live web** for matching products at real prices (Tavily, with Serper and a keyless
+DuckDuckGo fallback so a run never hard-blocks on a quota), reasons over the
+candidates, and settles the purchase through our own merchant + Gate + Razorpay —
+the merchant-of-record pattern real agentic checkout uses. It never drives a real
+retailer or moves real money; it discovers on the open web and the transaction
+clears a signed, merchant-enforced mandate, which is the whole point. A new
+mission-control UI streams every agent thought, tool call, web result, Gate check,
+and ledger row live, so the autonomy is *visible* instead of asserted. The hard
+rule going in: no hardcoded agent judgment anywhere — if a model call fails it
+retries through the gateway or the run surfaces the failure honestly. **The lesson:
+a demo that hides the agents behind buttons isn't a smaller version of the pitch,
+it's the opposite of it. Build the thing that shows the work.**
+
+---
+
 ## 2026-08-28 — Phase 6 was "done" in the notes and gone from the repo.
 
 **What broke.** Starting Phase 7, I went to build on top of Phase 6 and found
