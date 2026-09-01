@@ -192,6 +192,29 @@ USER_KEY_NAME = "user"                 # Ed25519 key the user signs Intent Manda
 # simply hasn't paid yet, not that anything failed.
 PAYMENT_CONFIRM_TIMEOUT_SECONDS = 180
 
+# --- Day 2: live tool-calling buyer (demo/agent.py + demo/tools.py) ----------
+# The live agentic path is ONE Gemini model running a bounded ReAct tool-calling
+# loop. These caps make that loop fail loudly on a fixed budget instead of
+# looping the demo into the ground or draining the shared Gemini quota — the
+# same spirit as ATTEMPT_CAP above, which this loop reuses for submit attempts.
+#
+# The boundary the caps defend: the LLM decides WHICH product / query / when to
+# retry; it never decides the price, the pay-authorisation, the signing key, or
+# these caps. A cap hit ends the run HONESTLY ("stopped: no fit under ₹X"),
+# never a faked success.
+AGENT_MAX_STEPS = 12          # hard cap on ReAct turns (one model call + its tool calls) per run
+# Per-run model-call budget. Today the loop makes exactly one model call per step,
+# so AGENT_MAX_STEPS binds first and this is the backstop that still holds when a
+# caller overrides max_steps upward, or if a future step ever fans out into more
+# than one model call. Kept > AGENT_MAX_STEPS on purpose so the step cap is the
+# normal terminator and this only catches the abnormal case.
+AGENT_MAX_LLM_CALLS = 20
+AGENT_SUBMIT_ATTEMPT_CAP = ATTEMPT_CAP  # sign_and_submit attempts before the run stops (reuses ATTEMPT_CAP=3)
+AGENT_LLM_PURPOSE = "buyer_brain"       # LLM gateway `purpose` for the buyer loop; NOT in FAST_LLM_SURFACES,
+                                        # so it routes to Gemini (tool-calling + numeric-adjacent), never the prose fast lane
+OPEN_PRODUCT_TIMEOUT_SECONDS = 8.0      # per-fetch HTTP timeout for the open_product tool (read-only page fetch)
+OPEN_PRODUCT_MAX_BYTES = 500_000        # cap bytes read from a product page, so a huge page can't stall a run
+
 # --- Phase 6: red team ------------------------------------------------------
 # Where the Attack Judge (#15) writes its per-attack findings, one JSON file
 # each. Curated into FAILURES.md by hand — the directory is the machine's
