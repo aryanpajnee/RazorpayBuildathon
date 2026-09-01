@@ -6,8 +6,12 @@ injecting a callable that raises, standing in for a missing key / outage.
 
 from __future__ import annotations
 
+import pytest
 from langchain_core.messages import AIMessage
 
+import config
+import demo.intent as di
+from buyer import llm
 from demo.intent import _fallback_category, understand_request
 
 
@@ -47,3 +51,24 @@ def test_fallback_strips_price_and_filler():
 
 def test_empty_request_is_general():
     assert understand_request("", invoke=_fake_invoke("")) == "general"
+
+
+# --- GroqCloud wiring (hermetic — no network) --------------------------------
+
+def test_groq_is_a_registered_provider_that_needs_a_key(monkeypatch):
+    assert "groq" in llm._VALID_PROVIDERS
+    assert config.MODELS.get("groq")  # a Groq model id is configured
+    monkeypatch.setattr(config, "GROQ_API_KEY", "", raising=False)
+    with pytest.raises(llm.MissingAPIKeyError):
+        llm.get_chat_model(provider="groq")  # key checked before any network/import
+
+
+def test_understand_falls_back_when_groq_key_missing(monkeypatch):
+    # No invoke injected → understand_request tries to build the Groq gateway;
+    # with no key it degrades to the deterministic fallback, never a crash and
+    # never a silent reroute to another model.
+    monkeypatch.setattr(config, "INTENT_PROVIDER", "groq", raising=False)
+    monkeypatch.setattr(config, "GROQ_API_KEY", "", raising=False)
+    monkeypatch.setattr(di, "_intent_invoke", None, raising=False)
+    out = understand_request("buy me wireless headphones under 5000")
+    assert out and "headphone" in out

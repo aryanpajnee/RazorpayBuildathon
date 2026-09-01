@@ -34,13 +34,14 @@ from dataclasses import dataclass
 import config
 
 _NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
+_GROQ_API_KEY_ENV = "GROQ_API_KEY"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
 _OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 
 DEFAULT_MAX_ATTEMPTS = config.LLM_MAX_ATTEMPTS
 DEFAULT_BACKOFF_BASE_SECONDS = config.LLM_RETRY_BACKOFF_BASE_SECONDS
 
-_VALID_PROVIDERS = ("gemini", "nvidia", "anthropic", "openai")
+_VALID_PROVIDERS = ("gemini", "nvidia", "groq", "anthropic", "openai")
 
 _SECONDS_PER_MINUTE = 60.0
 _SECONDS_PER_DAY = 86400.0
@@ -302,6 +303,22 @@ def get_chat_model(**overrides):
             model=model_name,
             api_key=config.NVIDIA_API_KEY,
             base_url=config.NVIDIA_BASE_URL,
+            temperature=temperature,
+            **overrides,
+        )
+
+    if provider == "groq":
+        # GroqCloud speaks the OpenAI wire protocol, so the OpenAI client reaches
+        # it with Groq's base_url. Used ONLY by the prompt-understanding step
+        # (demo/intent.py); never the tool-calling loop or a numeric surface.
+        if not config.GROQ_API_KEY:
+            raise MissingAPIKeyError("groq", _GROQ_API_KEY_ENV)
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=model_name,
+            api_key=config.GROQ_API_KEY,
+            base_url=config.GROQ_BASE_URL,
             temperature=temperature,
             **overrides,
         )

@@ -48,14 +48,31 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")
 NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
+# GroqCloud is OpenAI-wire-compatible (same as the NVIDIA lane), reached through
+# langchain-openai with Groq's base_url. It is used for EXACTLY ONE job — reading
+# the user's free-text purchase prompt into a product label (demo/intent.py, the
+# Intent Compiler's understand step). It is NOT wired into the buyer's tool-calling
+# loop or anything numeric: it only understands the prompt, extracts what to buy,
+# and hands that label into the (unchanged) chain. See INTENT_PROVIDER below.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+
 MODELS = {
     "gemini": "gemini-3.6-flash",      # free tier: 1500 req/day, 15 req/min, no card.
                                        # 2.5-flash is listed by the API but 404s for new keys.
     "nvidia": NVIDIA_MODEL,            # fast lane for non-numeric surfaces only
+    "groq": GROQ_MODEL,               # prompt-understanding only (demo/intent.py)
     "anthropic": "claude-sonnet-5",
     "openai": "gpt-4o",
 }
 CHAT_MODEL = MODELS[LLM_PROVIDER]
+
+# Which provider the prompt-understanding step (demo/intent.understand_request)
+# uses. The user asked for GroqCloud here specifically; it is the ONLY place Groq
+# is used. If its key is missing or the call fails, understand_request degrades to
+# a deterministic keyword-free fallback — the prompt step is never routed to a
+# different LLM behind the user's back, and a run never dies on it.
+INTENT_PROVIDER = os.getenv("INTENT_PROVIDER", "groq")
 
 # --- provider routing ------------------------------------------------------
 # Gemini 3.6 Flash is the default for everything numeric or judgment-critical:
@@ -79,6 +96,7 @@ TEMPERATURE = 0.0
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 

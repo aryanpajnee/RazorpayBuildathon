@@ -17,6 +17,10 @@ model misreads the request, the worst case is the wrong *kind* of product is
 searched for under the user's own budget — never an over-budget or unsigned
 purchase.
 
+The model behind this step is GroqCloud (`config.INTENT_PROVIDER`), wired here
+ONLY for reading the prompt — it never touches the buyer's tool-calling loop or
+anything numeric.
+
 Degrade, never hard-block: if the model is unavailable (no key, quota, outage)
 or returns nothing usable, a deterministic keyword-free fallback derives a label
 straight from the request text. A run must never die because the LLM hiccuped —
@@ -61,21 +65,44 @@ def _fallback_category(request: str) -> str:
     return normalize_category(" ".join(words[-3:]))
 
 
+_intent_invoke = None
+
+
+def _provider_invoke():
+    """Lazily build the invoke entry point for the configured prompt-understanding
+    provider (`config.INTENT_PROVIDER`, GroqCloud by default), wrapped in an
+    LLMGateway for the shared rate-guard + retry. Raises MissingAPIKeyError if the
+    provider's key is absent — the caller catches that and degrades to the
+    deterministic fallback, so the prompt step is never silently rerouted to a
+    different model."""
+    global _intent_invoke
+    if _intent_invoke is None:
+        from buyer.llm import LLMGateway, get_chat_model
+
+        model = get_chat_model(provider=config.INTENT_PROVIDER)
+        _intent_invoke = LLMGateway(model).invoke
+    return _intent_invoke
+
+
 def understand_request(request: str, *, invoke=None) -> str:
     """Return an open, normalised product category for a free-text request.
 
-    `invoke` is the LLM entry point (defaults to `buyer.llm.invoke`); inject a
-    fake in tests to exercise the model path without a network call. Any failure
-    — missing key, bad output, exception — falls through to `_fallback_category`,
-    so this function always returns a usable non-empty label.
+    Uses GroqCloud (`config.INTENT_PROVIDER`) to READ the prompt and extract what
+    the user wants to buy. `invoke` is the LLM entry point; leave it None for the
+    real Groq call, or inject a fake in tests to exercise the logic without a
+    network call. Any failure — missing key, bad output, exception — falls through
+    to `_fallback_category`, so this always returns a usable non-empty label and a
+    run never dies on the model.
     """
     request = (request or "").strip()
     if not request:
         return "general"
 
     if invoke is None:
-        from buyer.llm import invoke as _invoke  # lazy: importing never needs a key
-        invoke = _invoke
+        try:
+            invoke = _provider_invoke()
+        except Exception:  # noqa: BLE001 — no/invalid key: degrade to deterministic
+            return _fallback_category(request)
 
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
