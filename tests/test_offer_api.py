@@ -78,17 +78,23 @@ def test_offer_derives_category_from_title(client):
 # --- rejection -------------------------------------------------------------
 
 
-def test_offer_unknown_category_is_rejected(client):
+def test_offer_open_category_is_accepted(client):
+    """Open vocabulary: a category outside the merchant's seed taxonomy (e.g.
+    'electronics') is now listable and quotable — the buyer can shop for
+    anything. Only a find with NO determinable category at all is rejected
+    (see test_offer_uncategorisable_title_is_rejected)."""
     resp = client.post(
         "/offer",
         json={
-            "title": "Something",
-            "price_paise": 100000,
+            "title": "Wireless Headphones",
+            "price_paise": 199900,
             "category": "electronics",
         },
     )
-    assert resp.status_code == 400
-    assert resp.json()["detail"]["error"] == "offer_rejected"
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "quote_id" in body
+    assert isinstance(body["total_paise"], int)
 
 
 def test_offer_uncategorisable_title_is_rejected(client):

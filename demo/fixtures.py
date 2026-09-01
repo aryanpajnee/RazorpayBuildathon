@@ -94,14 +94,43 @@ OVER_BUDGET_SOCKS = SearchResult(
     snippet="Premium merino wool hiking socks, thermal insulation.",
 )
 
+# Headphones — a deliberately NON-sport product, to prove the open-vocabulary
+# path: the merchant has no "headphones" in its seed catalog, yet the buyer can
+# still search for, list, and buy them because the category is now understood
+# from the request, not looked up in a fixed table.
+CHEAP_HEADPHONES = SearchResult(
+    title="SoundWave BT-200 Wireless Headphones",
+    url="https://example-shop.test/products/soundwave-bt200",
+    price_paise=199_900,  # ~₹1,999 — in-budget
+    price_display="₹1,999",
+    seller="ExampleMart",
+    source="fixture",
+    snippet="Over-ear Bluetooth headphones with 30-hour battery.",
+)
+
+OVER_BUDGET_HEADPHONES = SearchResult(
+    title="AudioPro Studio ANC Headphones",
+    url="https://example-shop.test/products/audiopro-studio-anc",
+    price_paise=2_499_900,  # ~₹24,999 — drives an OVER_LIMIT refusal
+    price_display="₹24,999",
+    seller="ExampleMart",
+    source="fixture",
+    snippet="Reference studio headphones with active noise cancellation.",
+)
+
 # Keyword-routed result sets. `fake_search` picks a set by sniffing the query,
-# same spirit as `merchant.offers.map_to_category` — first match wins, checked
-# in a fixed order so the function stays deterministic.
+# purely so the fixture "feels" responsive; it is NOT the merchant's category
+# logic (that is now open-vocabulary and LLM-understood). First match wins,
+# checked in a fixed order so the function stays deterministic.
 _SHOE_RESULTS: tuple[SearchResult, ...] = (CHEAP_SHOE, OVER_BUDGET_SHOE, PRICELESS_SHOE)
 _SOCKS_RESULTS: tuple[SearchResult, ...] = (CHEAP_SOCKS, OVER_BUDGET_SOCKS)
+_AUDIO_RESULTS: tuple[SearchResult, ...] = (CHEAP_HEADPHONES, OVER_BUDGET_HEADPHONES)
 
 _KEYWORD_ROUTES: tuple[tuple[str, tuple[SearchResult, ...]], ...] = (
     ("sock", _SOCKS_RESULTS),
+    ("headphone", _AUDIO_RESULTS),
+    ("earbud", _AUDIO_RESULTS),
+    ("audio", _AUDIO_RESULTS),
     # "shoe"/"sneaker"/"trainer"/"running" all fall through to the shoe set,
     # which is also the default below — "running shoes" is the flagship demo
     # query and should always resolve to it even with no keyword match at all.
@@ -253,5 +282,32 @@ def recovery_script() -> ScriptedModel:
             ],
             [_tool_call("sign_and_submit", {}, "call_7")],
             "Recovered from the refusal — bought the StreetFlex Running Sneakers instead.",
+        ]
+    )
+
+
+def headphones_script() -> ScriptedModel:
+    """A NON-sport buy, proving the open-vocabulary path: search -> list the cheap
+    in-budget headphones -> sign & submit (passes) -> finish. The merchant has no
+    headphones in its seed catalog; this works because the run is scoped to the
+    category understood from the request, not to a fixed list.
+    """
+    return ScriptedModel(
+        turns=[
+            [_tool_call("web_search", {"query": "wireless headphones"}, "call_1")],
+            [
+                _tool_call(
+                    "list_with_merchant",
+                    {
+                        "title": CHEAP_HEADPHONES.title,
+                        "url": CHEAP_HEADPHONES.url,
+                        "price_paise": CHEAP_HEADPHONES.price_paise,
+                        "source": CHEAP_HEADPHONES.source,
+                    },
+                    "call_2",
+                )
+            ],
+            [_tool_call("sign_and_submit", {}, "call_3")],
+            "Order placed — the SoundWave wireless headphones are on the way.",
         ]
     )

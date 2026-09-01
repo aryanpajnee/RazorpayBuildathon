@@ -107,11 +107,22 @@ def test_create_offer_default_stock_and_source():
 
 # --- create_offer: rejections -------------------------------------------------
 
-def test_create_offer_rejects_unknown_category():
+def test_create_offer_accepts_open_category():
+    """Open vocabulary: a category outside the merchant's seed taxonomy (e.g.
+    'electronics') is now listable — the buyer can shop for anything. The label
+    is normalised and carried onto the offer for the Gate's exact-string match."""
+    offer = offers.create_offer(
+        title="Wireless Headphones", url="https://example.com/x",
+        price_paise=199_900, category="Electronics",
+    )
+    assert offer.category == "electronics"  # normalised (lower-cased)
+
+
+def test_create_offer_rejects_blank_category():
     with pytest.raises(offers.OfferError):
         offers.create_offer(
             title="Mystery Item", url="https://example.com/x",
-            price_paise=1000, category="electronics",
+            price_paise=1000, category="   ",
         )
 
 

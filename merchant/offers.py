@@ -133,6 +133,23 @@ def map_to_category(text: str) -> str | None:
     return None
 
 
+def normalize_category(text: str) -> str:
+    """Normalise any free-text category label to a clean, stable token: lower-cased,
+    trimmed, internal whitespace collapsed, length-capped.
+
+    The merchant's category vocabulary is OPEN (a web buyer can ask for anything,
+    not just `config.CATALOG_CATEGORIES`), so a category is whatever the buyer's
+    Intent Compiler understood the request to be ("headphones", "electronics", …).
+    What still has to hold is the Gate's check that a quoted product's category
+    EXACTLY equals the signed intent's category — an exact string compare. That is
+    reliable only if both sides are normalised the same way, which is this
+    function's whole job: sign the intent under `normalize_category(x)` and relist
+    the find under `normalize_category(x)` and the two match. No LLM runs here — it
+    is pure string hygiene on a label an LLM produced elsewhere.
+    """
+    return " ".join((text or "").strip().lower().split())[: config.CATEGORY_MAX_LEN]
+
+
 def _live_products() -> list[dict]:
     """The SAME list object `catalog.all_products()` / `catalog.get_product()`
     iterate, courtesy of `load_catalog`'s `@lru_cache(maxsize=1)`. Appending
@@ -188,11 +205,13 @@ def create_offer(
     if not title or not title.strip():
         raise OfferError("offer title must be non-empty")
 
-    if category not in config.CATALOG_CATEGORIES:
-        raise OfferError(
-            f"category {category!r} is not one of the merchant's categories: "
-            f"{config.CATALOG_CATEGORIES}"
-        )
+    # Open vocabulary: any non-empty label is listable, normalised for the Gate's
+    # exact-string category match (see normalize_category). We no longer reject a
+    # category for not being in config.CATALOG_CATEGORIES — that fixed list is only
+    # the merchant's seed inventory, not a cage on what a web buyer can ask for.
+    category = normalize_category(category)
+    if not category:
+        raise OfferError("offer category must be a non-empty label")
 
     if type(price_paise) is not int:
         raise OfferError(

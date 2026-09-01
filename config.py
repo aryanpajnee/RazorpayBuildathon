@@ -152,6 +152,21 @@ CURRENCY = "INR"
 # it must stay in step with the categories in data/catalog.json.
 CATALOG_CATEGORIES = ("footwear", "socks", "apparel", "accessories", "nutrition", "recovery", "bundle")
 
+# --- Open category vocabulary (Day 2+) --------------------------------------
+# CATALOG_CATEGORIES above is the merchant's OWN seed inventory taxonomy (used by
+# data/catalog.json, map_to_category, the storefront/intent-compiler prose). The
+# live web buyer is NOT limited to it: an LLM reads the user's free-text request
+# ("wireless headphones") and produces an OPEN category label, which is signed
+# into the Intent Mandate and which a web find is then relisted under. The Gate
+# still enforces (deterministically) that the offer's category equals the signed
+# intent's category — the vocabulary is open, the enforcement is not.
+#   Boundary: the LLM only NAMES the product scope; it never decides the price,
+#   the budget, the signature, or whether payment clears. The hard money bound is
+#   max_paise (the budget), which never touches an LLM.
+CATEGORY_MAX_LEN = 40                    # a category is a short label, not a paragraph
+AGENT_CATEGORY_PURPOSE = "intent_compiler"  # LLM gateway purpose for understanding the request
+                                            # (Intent Compiler surface #7; Gemini, not the prose fast lane)
+
 # GST as integer basis points, not 0.18. A float rate is how a float gets into
 # a paise amount: total * 0.18 returns a float no matter how careful the caller
 # is. Basis points keep the whole computation in ints.

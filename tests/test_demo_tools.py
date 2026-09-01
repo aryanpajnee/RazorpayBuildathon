@@ -46,9 +46,10 @@ def _fake_search(query, *, max_results=None):
     ]
 
 
-def _ctx(budget_rupees, gw=None):
+def _ctx(budget_rupees, gw=None, category="footwear"):
+    # category passed explicitly so these tests never call the LLM understander.
     return tools.grant_intent(
-        request="running shoes", budget_paise=budget_rupees * 100,
+        request="running shoes", budget_paise=budget_rupees * 100, category=category,
         search_fn=_fake_search, gateway=gw or FakeGateway(),
     )
 
@@ -75,13 +76,17 @@ def test_list_with_merchant_makes_a_quote_for_in_category_find():
     assert ctx.quotes[ctx.last_quote_id].total_paise >= 105_900
 
 
-def test_list_with_merchant_rejects_uncategorisable_title():
-    ctx = _ctx(9000)
+def test_list_with_merchant_lists_any_title_under_run_category():
+    """Open vocabulary: a non-sport title the seed keyword map wouldn't recognise
+    still lists (under the run's signed category) and clears the Gate."""
+    gw = FakeGateway()
+    ctx = _ctx(9000, gw=gw, category="headphones")
     t = _tools_by_name(ctx)
     out = t["list_with_merchant"].func(
-        title="Mystery Widget XYZ", url="https://ex.test/z", price_paise=50_000)
-    assert "does not map to a category" in out
-    assert ctx.last_quote_id is None  # no quote created
+        title="SoundWave BT-200 Wireless Headphones", url="https://ex.test/h", price_paise=199_900)
+    assert "quote_id" in out and ctx.last_quote_id is not None
+    submitted = t["sign_and_submit"].func()
+    assert "GATE PASS" in submitted and gw.calls == 1  # category matched the signed scope  # no quote created
 
 
 def test_list_with_merchant_rejects_float_price():
@@ -150,6 +155,7 @@ def test_finish_sets_the_flag():
     assert ctx.finished is True and ctx.summary == "done"
 
 
-def test_grant_intent_rejects_uncategorisable_request():
-    with pytest.raises(ValueError):
-        tools.grant_intent(request="buy me a yacht", budget_paise=100_000)
+def test_grant_intent_accepts_and_normalizes_open_category():
+    ctx = tools.grant_intent(
+        request="wireless headphones", budget_paise=500_000, category="  Electronics  ")
+    assert ctx.category == "electronics" and ctx.intent_mandate_id

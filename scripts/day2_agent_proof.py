@@ -80,15 +80,23 @@ def _print_transcript(transcript: list[dict]) -> None:
                 print(_c(colour, f"    {line}"))
 
 
-def run_offline(recovery: bool) -> int:
-    print(_c("1", f"Mode: OFFLINE (zero API — scripted model + fake search + FakeGateway)"
-                  f"{'  [recovery script]' if recovery else ''}"))
+_SCENARIOS = {
+    #  name          (script builder,               request,               budget, category)
+    "happy":      (fixtures.happy_path_script,   "running shoes",        9000, "footwear"),
+    "recovery":   (fixtures.recovery_script,     "running shoes",        3000, "footwear"),
+    "headphones": (fixtures.headphones_script,   "wireless headphones",  5000, "headphones"),
+}
+
+
+def run_offline(scenario: str) -> int:
+    build, request, budget, category = _SCENARIOS[scenario]
+    print(_c("1", f"Mode: OFFLINE (zero API — scripted model + fake search + FakeGateway)  "
+                  f"[{scenario}]"))
     offers.clear_offers()
-    model = fixtures.recovery_script() if recovery else fixtures.happy_path_script()
-    # recovery lists a ₹18,999 shoe first (refused), then the ₹1,059 one — a
-    # ₹3,000 budget admits the cheap one; the happy path uses ₹9,000.
-    budget = 3000 if recovery else 9000
-    res = agent.run("running shoes", budget, model=model,
+    # category is injected here only to keep the OFFLINE run fully deterministic
+    # (no LLM understander call). In --live the category is understood from the
+    # request by the Intent Compiler LLM — that's what makes "buy anything" work.
+    res = agent.run(request, budget, category=category, model=build(),
                     search_fn=fixtures.fake_search, gateway=FakeGateway())
     _print_transcript(res.transcript)
     _print_summary(res)
@@ -139,13 +147,17 @@ def main() -> None:
                    help="run the REAL agent (Gemini + web search + Razorpay test mode). Spends credits.")
     p.add_argument("--recovery", action="store_true",
                    help="offline only: use the refusal-then-recover script instead of the happy path.")
+    p.add_argument("--headphones", action="store_true",
+                   help="offline only: buy headphones — an open-vocabulary, non-sport product the "
+                        "merchant has no fixed category for. Proves 'buy anything'.")
     p.add_argument("--request", default="running shoes", help="what to buy (live mode).")
     p.add_argument("--max-rupees", type=int, default=6000, help="budget ceiling in whole rupees (live mode).")
     args = p.parse_args()
 
     if args.live:
         sys.exit(run_live(args.request, args.max_rupees))
-    sys.exit(run_offline(args.recovery))
+    scenario = "recovery" if args.recovery else ("headphones" if args.headphones else "happy")
+    sys.exit(run_offline(scenario))
 
 
 if __name__ == "__main__":

@@ -120,22 +120,20 @@ def grant_intent(
     the intent (bound to this agent's public key) IS the grant of authority the
     Gate later checks a Cart Mandate against.
 
-    `category` is chosen DETERMINISTICALLY from the request when not supplied —
-    `offers.map_to_category` walks `config.CATALOG_CATEGORIES` by keyword. It is
-    never an LLM decision: the Gate's category check is an exact-string compare,
-    and a model's guess there is precisely the nondeterminism the money path
-    forbids. A request that maps to no category raises — the caller decides what
-    to do, rather than a wrong category being guessed into a signed mandate.
+    `category` is the OPEN, normalised product label the run is scoped to. When
+    not supplied it is understood from the free-text request by the Intent
+    Compiler LLM (`demo.intent.understand_request`) — the user can ask for
+    anything, not just a fixed list. The label is signed into the intent and the
+    Gate later enforces (deterministically, by exact string match) that the
+    relisted offer carries the same category. The LLM only NAMES the scope; it
+    never sets the price, the budget, or the pay decision.
     """
     if category is None:
-        category = offers.map_to_category(request)
-    if category is None:
-        raise ValueError(
-            f"request {request!r} does not map to any category Northwind sells "
-            f"({config.CATALOG_CATEGORIES}); cannot grant an intent"
-        )
-    if category not in config.CATALOG_CATEGORIES:
-        raise ValueError(f"category {category!r} is not one of {config.CATALOG_CATEGORIES}")
+        from demo.intent import understand_request
+        category = understand_request(request)
+    category = offers.normalize_category(category)
+    if not category:
+        raise ValueError(f"could not derive a product category from request {request!r}")
 
     sk, vk = generate_keypair()
     agent_id = f"agent_{vk.encode().hex()[:8]}"
@@ -306,12 +304,11 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
                 f"price_paise must be an integer number of paise, got "
                 f"{type(price_paise).__name__}. Re-read the candidate's price_paise value."
             )
-        category = offers.map_to_category(title)
-        if category is None:
-            return (
-                f"{title!r} does not map to a category Northwind sells "
-                f"({', '.join(config.CATALOG_CATEGORIES)}). Pick a different product."
-            )
+        # The offer is relisted under the run's SIGNED scope (context.category),
+        # so the Gate's exact-string category check matches. No keyword table, no
+        # fixed vocabulary — the user asked for this product type and signed for
+        # it, so a find picked to fulfil that request is listed under it.
+        category = context.category
         try:
             offer = offers.create_offer(
                 title=title, url=url, price_paise=price_paise, category=category, source=source

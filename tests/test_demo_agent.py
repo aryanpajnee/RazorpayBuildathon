@@ -40,7 +40,7 @@ def _kinds(transcript):
 
 def test_happy_path_places_one_order():
     gw = FakeGateway()
-    res = agent.run("running shoes", 9000, model=fixtures.happy_path_script(),
+    res = agent.run("running shoes", 9000, category="footwear", model=fixtures.happy_path_script(),
                     search_fn=fixtures.fake_search, gateway=gw)
     assert res.status == "ordered"
     assert res.order_id and res.order_id.startswith("order_")
@@ -57,8 +57,8 @@ def test_missing_model_returns_honest_status_not_a_traceback(monkeypatch):
     # let MissingAPIKeyError escape.
     monkeypatch.setattr(config, "GEMINI_API_KEY", "", raising=False)
     monkeypatch.setattr(config, "LLM_PROVIDER", "gemini", raising=False)
-    res = agent.run("running shoes", 9000, model=None, search_fn=fixtures.fake_search,
-                    gateway=FakeGateway())
+    res = agent.run("running shoes", 9000, category="footwear", model=None,
+                    search_fn=fixtures.fake_search, gateway=FakeGateway())
     assert res.status == "no_model"
     assert res.order_id is None
 
@@ -66,7 +66,7 @@ def test_missing_model_returns_honest_status_not_a_traceback(monkeypatch):
 def test_recovery_path_refuses_then_succeeds():
     gw = FakeGateway()
     # Budget admits the cheap shoe (~₹1,059 + GST/ship) but not the ₹18,999 one.
-    res = agent.run("running shoes", 3000, model=fixtures.recovery_script(),
+    res = agent.run("running shoes", 3000, category="footwear", model=fixtures.recovery_script(),
                     search_fn=fixtures.fake_search, gateway=gw)
     assert res.status == "ordered"
     assert gw.calls == 1  # exactly one order despite two submit attempts
@@ -81,7 +81,7 @@ def test_step_cap_stops_a_model_that_never_finishes():
         turns=[[{"name": "web_search", "args": {"query": "running shoes"}, "id": f"c{i}"}]
                for i in range(50)])
     gw = FakeGateway()
-    res = agent.run("running shoes", 9000, model=never_ends,
+    res = agent.run("running shoes", 9000, category="footwear", model=never_ends,
                     search_fn=fixtures.fake_search, gateway=gw, max_steps=5)
     assert res.status in ("step_cap", "llm_budget_exhausted")
     assert res.order_id is None
@@ -89,8 +89,19 @@ def test_step_cap_stops_a_model_that_never_finishes():
     assert res.steps <= 5
 
 
-def test_uncategorisable_request_stops_cleanly():
-    res = agent.run("buy me a yacht", 9000, model=fixtures.happy_path_script(),
+def test_open_vocabulary_buys_a_non_sport_product():
+    """The headline change: buy something the merchant has no category for.
+    'headphones' is not in the seed taxonomy, yet the whole flow completes."""
+    gw = FakeGateway()
+    res = agent.run("wireless headphones", 5000, category="headphones",
+                    model=fixtures.headphones_script(), search_fn=fixtures.fake_search, gateway=gw)
+    assert res.status == "ordered"
+    assert res.order_id and gw.calls == 1
+
+
+def test_empty_category_stops_cleanly():
+    # If understanding yields nothing usable, stop honestly — never guess.
+    res = agent.run("...", 9000, category="", model=fixtures.happy_path_script(),
                     search_fn=fixtures.fake_search, gateway=FakeGateway())
     assert res.status == "no_category"
     assert res.order_id is None

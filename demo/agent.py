@@ -80,6 +80,7 @@ def run(
     request: str,
     budget_rupees: int,
     *,
+    category: str | None = None,
     model=None,
     search_fn=None,
     gateway=None,
@@ -101,12 +102,19 @@ def run(
     # proof script and a single-user UI); clear_offers is process-global.
     offers.clear_offers()
 
-    # 1. Deterministic category from the request — never an LLM guess.
-    category = offers.map_to_category(request)
+    # 1. The product scope. Open vocabulary: understood from the free-text request
+    #    by the Intent Compiler LLM (or injected for a deterministic offline run).
+    #    This label is what the user signs for; the Gate enforces it, the LLM never
+    #    sets the budget or the pay decision. Degrades to a deterministic fallback,
+    #    so a run is not blocked by a model hiccup.
     if category is None:
+        from demo.intent import understand_request
+        category = understand_request(request)
+    category = offers.normalize_category(category)
+    if not category:
         return RunResult(
             status="no_category",
-            reason=f"'{request}' doesn't map to a category Northwind sells.",
+            reason=f"could not understand a product to buy from '{request}'.",
             transcript=transcript,
         )
 
