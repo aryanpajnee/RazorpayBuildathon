@@ -322,3 +322,97 @@ CATEGORY_KEYWORDS = {
     "recovery": ("roller", "massage", "recovery", "compression", "ice"),
     "bundle": ("bundle", "combo", "kit", "pack"),
 }
+
+# --- Day 3: mission-control dashboard (event bus + SSE) ----------------------
+# The React "mission control" view drives itself off a live event stream
+# (demo/events.py's EventBus) rather than polling — the agent run happens on
+# a worker thread, an SSE endpoint drains the bus on the main thread. See
+# scratchpad/day3/EVENT_SCHEMA.md for the full event contract this feeds.
+
+# 0 = unbounded queue. A single demo run emits at most a few dozen events
+# (search results, tool calls, one gate decision, one ledger append) before
+# terminating, so there is no flood scenario worth bounding against; an
+# unbounded queue means emit() can never block the worker thread on a slow
+# or stalled SSE consumer.
+EVENT_QUEUE_MAXSIZE = 0
+
+# How often the SSE layer sends a `: ping\n\n` comment frame to keep the
+# connection alive through proxies/load balancers that time out an idle
+# HTTP response. Not read by demo/events.py itself — the future SSE server
+# module uses this while waiting on EventBus.stream().
+SSE_KEEPALIVE_SECONDS = 15.0
+
+# The dashboard's mode toggle defaults to the hermetic, zero-API rehearsal
+# path (demo/fixtures.py: fake search + scripted model + FakeGateway) so a
+# reload or a fresh demo machine never accidentally burns the shared Gemini
+# quota or fires a real Razorpay call. "live" runs the real agent and is
+# selected by a human, on purpose, before recording.
+UI_DEFAULT_MODE = "offline"
+
+# Ordered roster for the dashboard's left column — which agent/component
+# "lights up" as the run progresses. Purely DISPLAY metadata: no code path
+# reads `id` to route logic, it only labels events for the UI. Order follows
+# the canonical flow (CLAUDE.md): intent understanding -> consent -> the
+# buyer's own reasoning/search loop -> the merchant's offer+quote -> the
+# Gate -> the ledger.
+AGENT_ROSTER = (
+    {"id": "intent", "label": "Intent Compiler", "role": "reads the request into a signed, budget-bounded product scope"},
+    {"id": "buyer", "label": "Buyer Agent", "role": "the tool-calling ReAct loop deciding what to buy"},
+    {"id": "search", "label": "Web Search", "role": "read-only product discovery across the open web"},
+    {"id": "merchant", "label": "Northwind (Merchant)", "role": "relists a find as an offer and issues the quote"},
+    {"id": "gate", "label": "The Gate", "role": "deterministically re-verifies and authorises (or refuses) the cart"},
+    {"id": "ledger", "label": "Ledger", "role": "the hash-chained audit trail of every Gate decision"},
+)
+
+# The Gate's seven checks (merchant/gate.py `check()`), in the fixed order it
+# runs them, as human/UI-friendly display names. Read directly from that
+# file's a-g structure:
+#   a. Ed25519 signature valid, and the chain of authority it names is real
+#      (includes: envelope signature, intent-on-file lookup, agent_id
+#      binding, agent pubkey binding, merchant binding)
+#   b. Intent mandate not expired
+#   c. Total <= the intent's max_paise (plus currency, category, purchase
+#      count — all resolved together once the quote is loaded)
+#   d. cart_hash matches the quote the merchant issued
+#   e. Quote within its TTL
+#   f. Nonce unseen (replay defence)
+#   g. Price unchanged since the quote was issued
+GATE_CHECK_SEQUENCE = (
+    "Signature",
+    "Intent live",
+    "Budget",
+    "Cart hash",
+    "Quote TTL",
+    "Nonce",
+    "Price",
+)
+
+# Maps every refusal `reason_code` in merchant/gate.py's `_VALID_CODES` to the
+# 0-based index (into GATE_CHECK_SEQUENCE above) of the check that produces
+# it, so the UI can render exactly which check went red and leave the ones
+# after it "pending". DERIVED FROM merchant/gate.py's `check()` body on
+# 2026-09-02 — if a future edit to gate.py adds, renames, or reorders a
+# reason_code, this map (and GATE_CHECK_SEQUENCE above) must be updated to
+# match, or the dashboard will show a stale check as the failure point.
+#
+# QUOTE_NOT_FOUND has no letter of its own in the gate-spec's a-g labelling
+# (the quote is loaded as a prerequisite right before check c uses it), but
+# in gate.py's actual run order it can only fail before currency/over-limit/
+# category/purchases are ever checked, so it is grouped under check c (index
+# 2) alongside them.
+GATE_CODE_TO_CHECK = {
+    "SIG_INVALID": 0,           # (a) envelope signature or agent-pubkey binding invalid
+    "INTENT_NOT_FOUND": 0,      # (a) no intent mandate on file for the cart's intent_mandate_id
+    "AGENT_MISMATCH": 0,        # (a) cart's agent_id != the intent's agent_id
+    "WRONG_MERCHANT": 0,        # (a) cart or intent addressed to a different merchant
+    "INTENT_EXPIRED": 1,        # (b) intent mandate has expired
+    "QUOTE_NOT_FOUND": 2,       # (c, prerequisite) no quote on file for the cart's quote_id
+    "CURRENCY_MISMATCH": 2,     # (c) cart/intent/merchant currency disagree
+    "OVER_LIMIT": 2,            # (c) total exceeds the intent's max_paise
+    "CATEGORY_MISMATCH": 2,     # (c) a quoted sku's category != the intent's category
+    "PURCHASES_EXHAUSTED": 2,   # (c) intent's max_purchases already used up
+    "CART_HASH_MISMATCH": 3,    # (d) cart_hash != the merchant's stored quote's cart_hash
+    "QUOTE_EXPIRED": 4,         # (e) quote has exceeded QUOTE_TTL_SECONDS
+    "NONCE_REUSED": 5,          # (f) this cart mandate's nonce was already spent
+    "PRICE_DRIFT": 6,           # (g) catalog price changed since the quote was issued
+}
