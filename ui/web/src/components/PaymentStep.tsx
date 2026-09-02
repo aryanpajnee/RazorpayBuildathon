@@ -1,23 +1,19 @@
-// Step 4 — an approval gate, then payment, then the final confirmation.
+// Step 4 — an approval gate, then the hand-off to the Razorpay gateway.
 // The FIRST thing shown on entry is the payment agent's approval dialog;
-// nothing is requested from the backend and no checkout opens until the
-// human approves. That approval, plus the mandate the Gate already
-// enforced, is the only authority this step acts on — the LLM never
-// touches this path. On approval we ask the backend for a payment target
-// (POST /api/pay). In "Test run" mode, or whenever no real Razorpay keys
-// are configured, the backend hands back a clearly-labelled simulated
-// capture and this step shows a single "Pay with netbanking (test)"
-// button that completes it locally. When real test-mode keys are active,
-// the backend instead returns a real Razorpay order and this step opens
-// the actual Checkout.js netbanking flow.
+// nothing is requested from the backend until the human approves. On approval
+// the agent creates a Razorpay TEST-MODE hosted payment page and redirects the
+// browser straight to the gateway, where the user pays (netbanking / card).
+// Razorpay returns them to this app afterwards (App reads that return). The
+// authority to pay is the human approval plus the already Gate-enforced
+// mandate — no LLM touches this path. When no real keys are on file, a
+// clearly-labelled simulated test capture completes in-app instead.
 import { useEffect, useRef, useState } from "react";
 import { confirmPayment, requestPayment, type PayResponse } from "../api";
 import { rupees } from "../format";
-import { loadRazorpayScript, openRazorpayCheckout } from "../razorpay";
 import type { RunMode } from "../types";
 import ApprovalDialog from "./ApprovalDialog";
 
-type Phase = "approval" | "starting" | "awaiting" | "paying" | "done" | "failed" | "cancelled";
+type Phase = "approval" | "starting" | "redirecting" | "awaiting" | "paying" | "done" | "failed" | "cancelled";
 
 interface Props {
   amountPaise: number;
@@ -49,11 +45,10 @@ export default function PaymentStep({
   const [errorText, setErrorText] = useState<string | null>(null);
   const activeRef = useRef(true);
 
-  // Guards the async payment calls below against setting state after this
-  // step has been navigated away from. Set true on every effect run (not
-  // just via the useRef initialiser) because React 18 StrictMode's dev-only
-  // mount -> cleanup -> mount dance would otherwise leave this stuck false
-  // after the first mount, silently swallowing every later state update.
+  // Guards the async calls below against setting state after this step has been
+  // navigated away from. Set true on every effect run (not just the useRef
+  // initialiser) so React 18 StrictMode's dev-only mount → cleanup → mount
+  // dance doesn't leave it stuck false and swallow later updates.
   useEffect(() => {
     activeRef.current = true;
     return () => {
@@ -63,7 +58,7 @@ export default function PaymentStep({
 
   async function startPayment() {
     setPhase("starting");
-    const res = await requestPayment(amountPaise, request, mode);
+    const res = await requestPayment(amountPaise, request, mode, window.location.origin);
     if (!activeRef.current) return;
     if (!res) {
       setErrorText("Could not reach the payment endpoint.");
@@ -71,16 +66,15 @@ export default function PaymentStep({
       return;
     }
     setPay(res);
-    // On approval the payment agent acts immediately: for a real test-mode
-    // order it opens the netbanking checkout itself (the human only completes
-    // the mock-bank Success). The "awaiting" panel with its button is then
-    // just the retry surface if the checkout is dismissed. The no-keys
-    // simulated path keeps its explicit button.
-    if (res.gateway === "razorpay" && res.key_id) {
-      void payRazorpay(res);
-    } else {
-      setPhase("awaiting");
+    if (res.gateway === "razorpay" && res.payment_url) {
+      // Hand off to the gateway: a full-page redirect to Razorpay's hosted
+      // payment page. The user pays there; Razorpay returns them to the app.
+      setPhase("redirecting");
+      window.location.assign(res.payment_url);
+      return;
     }
+    // No hosted link (no real keys configured): the simulated test path.
+    setPhase("awaiting");
   }
 
   function handleApprove() {
@@ -91,9 +85,9 @@ export default function PaymentStep({
     setPhase("cancelled");
   }
 
-  async function finish(orderId: string, paymentId?: string, signature?: string) {
+  async function finish(orderId: string) {
     setPhase("paying");
-    const confirmed = await confirmPayment(orderId, paymentId, signature);
+    const confirmed = await confirmPayment(orderId);
     if (!activeRef.current) return;
     if (!confirmed) {
       setErrorText("The payment went through, but the confirmation call failed.");
@@ -107,33 +101,6 @@ export default function PaymentStep({
   async function payTestSim() {
     if (!pay) return;
     await finish(pay.order_id);
-  }
-
-  async function payRazorpay(target: PayResponse | null = pay) {
-    if (!target || !target.key_id) return;
-    setPhase("starting");
-    try {
-      await loadRazorpayScript();
-      openRazorpayCheckout({
-        key: target.key_id,
-        order_id: target.order_id,
-        amount: target.amount_paise,
-        currency: target.currency,
-        name: "Vera",
-        description: request,
-        prefill: { method: "netbanking" },
-        theme: { color: "#2E6A4F" },
-        handler: (response) => {
-          void finish(response.razorpay_order_id, response.razorpay_payment_id, response.razorpay_signature);
-        },
-        modal: {
-          ondismiss: () => setPhase("awaiting"),
-        },
-      });
-    } catch {
-      setErrorText("Could not open the Razorpay checkout.");
-      setPhase("failed");
-    }
   }
 
   if (phase === "done" && done) {
@@ -193,7 +160,8 @@ export default function PaymentStep({
         </div>
       )}
 
-      {phase === "starting" && <p className="payment__status">Payment agent — opening secure netbanking…</p>}
+      {phase === "starting" && <p className="payment__status">Payment agent — reaching the Razorpay gateway…</p>}
+      {phase === "redirecting" && <p className="payment__status">Taking you to the Razorpay gateway…</p>}
       {phase === "paying" && <p className="payment__status">Confirming the payment…</p>}
 
       {phase === "awaiting" && pay?.gateway === "test-sim" && (
@@ -201,17 +169,7 @@ export default function PaymentStep({
           <p className="payment__amount mono">{rupees(pay.amount_paise)}</p>
           <p className="payment__note">Test-mode payment — no real money moves.</p>
           <button className="btn btn--primary" type="button" onClick={() => void payTestSim()}>
-            Pay with netbanking (test)
-          </button>
-        </div>
-      )}
-
-      {phase === "awaiting" && pay?.gateway === "razorpay" && (
-        <div className="payment__panel">
-          <p className="payment__amount mono">{rupees(pay.amount_paise)}</p>
-          <p className="payment__note">Real Razorpay test-mode order — the mock bank page's Success button completes it.</p>
-          <button className="btn btn--primary" type="button" onClick={() => void payRazorpay()}>
-            Pay with netbanking
+            Pay (test)
           </button>
         </div>
       )}
@@ -219,9 +177,14 @@ export default function PaymentStep({
       {phase === "failed" && (
         <div className="payment__error" role="alert">
           <p>{errorText}</p>
-          <button className="btn" type="button" onClick={onStartOver}>
-            Start over
-          </button>
+          <div className="payment__cancelled-actions">
+            <button className="btn btn--primary" type="button" onClick={() => void startPayment()}>
+              Try again
+            </button>
+            <button className="btn" type="button" onClick={onStartOver}>
+              Start over
+            </button>
+          </div>
         </div>
       )}
     </section>

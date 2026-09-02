@@ -93,6 +93,9 @@ export interface PayResponse {
   gateway: "test-sim" | "razorpay";
   order_id: string;
   key_id?: string;
+  // The hosted Razorpay payment page (rzp.io/...) the buyer is redirected to.
+  // Present on the real-gateway path; absent on the simulated-test path.
+  payment_url?: string;
   amount_paise: number;
   currency: string;
 }
@@ -101,12 +104,13 @@ export async function requestPayment(
   amountPaise: number,
   request: string,
   mode: RunMode,
+  origin?: string,
 ): Promise<PayResponse | null> {
   try {
     const res = await fetch("/api/pay", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ amount_paise: amountPaise, request, mode }),
+      body: JSON.stringify({ amount_paise: amountPaise, request, mode, origin }),
     });
     if (!res.ok) return null;
     return (await res.json()) as PayResponse;

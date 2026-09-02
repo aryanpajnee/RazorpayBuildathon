@@ -99,6 +99,7 @@ class PayBody(BaseModel):
     amount_paise: int
     request: str
     mode: str = config.UI_DEFAULT_MODE
+    origin: str | None = None  # where to send the browser back after the hosted payment
 
 
 def _simulated_payment(amount_paise: int) -> dict:
@@ -119,33 +120,48 @@ def _simulated_payment(amount_paise: int) -> dict:
 
 @app.post("/api/pay")
 def pay(body: PayBody) -> dict:
-    """Create a payment target for Vera's own checkout step.
+    """Create a payment target for Vera's checkout step.
+
+    Once the Gate has authorised the cart, the payment agent sends the buyer
+    straight to the Razorpay gateway to pay. To make that a genuine "you are now
+    on the gateway" hand-off (not a fragile in-page modal), this creates a
+    Razorpay TEST-MODE **Payment Link** -- a hosted Razorpay page -- and returns
+    its `payment_url`; the frontend redirects the browser there. On success
+    Razorpay sends the browser back to `origin/?vera_paid=1`.
 
     This is deliberately NOT the frozen money path's `merchant.gateway.create_order`
-    (which ties a quote_id to an idempotent order record for the mandate-enforced
-    cart) -- by the time a run reaches this step, that cart has already cleared
-    the Gate. This endpoint creates a second, independent Razorpay test-mode
-    order for the same amount so the demo can show the actual netbanking
-    checkout on camera, using `merchant.gateway.RazorpayGateway` directly."""
+    (the mandate-enforced cart already cleared the Gate); it is Vera's own
+    demo checkout. Falls back to a clearly-labelled simulated capture only when
+    there are no real Razorpay keys on file, so the step never dead-ends."""
     if config.USE_FAKE_GATEWAY:
         return _simulated_payment(body.amount_paise)
 
     try:
-        from merchant.gateway import RazorpayGateway
+        import razorpay
 
-        gateway = RazorpayGateway()
-        receipt = f"vera_{uuid.uuid4().hex[:10]}"
-        raw = gateway.create_order(body.amount_paise, config.CURRENCY, receipt, {"request": body.request})
+        client = razorpay.Client(auth=(config.RAZORPAY_KEY_ID, config.RAZORPAY_KEY_SECRET))
+        payload: dict = {
+            "amount": body.amount_paise,
+            "currency": config.CURRENCY,
+            "accept_partial": False,
+            "reference_id": f"vera_{uuid.uuid4().hex[:12]}",
+            "description": f"Vera — {body.request}"[:250],
+            "reminder_enable": False,
+        }
+        if body.origin:
+            payload["callback_url"] = f"{body.origin.rstrip('/')}/?vera_paid=1"
+            payload["callback_method"] = "get"
+        link = client.payment_link.create(payload)
         return {
             "gateway": "razorpay",
-            "order_id": raw["id"],
-            "key_id": config.RAZORPAY_KEY_ID,
+            "payment_url": link["short_url"],
+            "order_id": link["id"],
             "amount_paise": body.amount_paise,
             "currency": config.CURRENCY,
         }
     except Exception:
         # Never expose the key secret, and never let a gateway hiccup dead-end
-        # the demo -- fall back to the same simulated shape offline mode uses.
+        # the demo -- fall back to the same simulated shape.
         return _simulated_payment(body.amount_paise)
 
 
