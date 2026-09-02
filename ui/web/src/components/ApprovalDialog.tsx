@@ -85,7 +85,7 @@ export default function ApprovalDialog({ amountPaise, productTitle, budgetPaise,
         tabIndex={-1}
         onKeyDown={handleKeyDown}
       >
-        <p className="approval-dialog__eyebrow">Payment agent</p>
+        <p className="approval-dialog__eyebrow">Vera · payment agent</p>
         <h2 id={TITLE_ID} className="approval-dialog__title">
           Approve this payment?
         </h2>
@@ -94,8 +94,8 @@ export default function ApprovalDialog({ amountPaise, productTitle, budgetPaise,
           test mode.
         </p>
         <p className="approval-dialog__context">
-          Within your signed budget of <span className="mono">{rupees(budgetPaise)}</span>. The merchant re-verified
-          the price. You approve every payment.
+          That&rsquo;s under your signed budget of <span className="mono">{rupees(budgetPaise)}</span>, and the merchant
+          re-verified the price. Approve to go to the Razorpay gateway.
         </p>
         <p className="approval-dialog__note">Razorpay test-mode payment — no real money moves.</p>
         <div className="approval-dialog__actions">

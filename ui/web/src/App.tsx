@@ -5,7 +5,7 @@ import PaymentStep from "./components/PaymentStep";
 import TopBar from "./components/TopBar";
 import VerdictStep from "./components/VerdictStep";
 import WorkingStep from "./components/WorkingStep";
-import { chosenProduct, completion, latestQuote } from "./reducer";
+import { chosenProduct, completion, latestGateResult, latestQuote } from "./reducer";
 import type { AppEvent, RunMode } from "./types";
 
 export type Step = "compose" | "working" | "verdict" | "payment";
@@ -52,13 +52,28 @@ export default function App() {
     setStep("working");
     await resetLedger();
 
+    // Accumulate the raw events as they stream so the completion handler can
+    // read the final Gate decision synchronously (setEvents is async and its
+    // closure would lag behind the last event).
+    const collected: AppEvent[] = [];
+
     await runAgent(
       { request: requestText, budget_rupees: budgetRupees, mode: runMode },
       {
         onEvent: (event) => {
           if (runToken.current !== token) return;
+          collected.push(event);
           setEvents((prev) => [...prev, event]);
-          if (event.type === "run_complete") setStep("verdict");
+          if (event.type === "run_complete") {
+            // Happy path — the Gate authorised and there's a merchant quote to
+            // pay: skip the verdict stop and go straight to the payment
+            // hand-off, which opens with Vera's single confirmation popup and
+            // then the Razorpay gateway. Anything else (a refusal, or no quote)
+            // lands on the verdict, where the reason is shown.
+            const gate = latestGateResult(collected);
+            const quote = latestQuote(collected);
+            setStep(gate?.passed && quote ? "payment" : "verdict");
+          }
         },
         onError: (message) => {
           if (runToken.current !== token) return;

@@ -141,6 +141,28 @@ export function installDevMock() {
         headers: { "Content-Type": "text/event-stream" },
       });
     }
+    // Confirm must be matched before "/api/pay" (the latter is a substring).
+    if (url.includes("/api/pay/confirm")) {
+      return new Response(
+        JSON.stringify({ status: "captured", order_id: "order_MOCK", method: "netbanking", test_mode: true }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.includes("/api/pay")) {
+      // Point the "gateway" at this app's own success return so the redirect
+      // lands on the paid-confirmation screen instead of a real Razorpay page.
+      const successUrl = `${window.location.origin}${window.location.pathname}?vera_paid=1&razorpay_payment_id=pay_TEST_MOCK&razorpay_payment_link_status=paid`;
+      return new Response(
+        JSON.stringify({
+          gateway: "razorpay",
+          order_id: "order_MOCK",
+          payment_url: successUrl,
+          amount_paise: 304900,
+          currency: "INR",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     return realFetch(input, init);
   }) as typeof window.fetch;
 }
