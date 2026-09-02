@@ -5,7 +5,7 @@ import PaymentStep from "./components/PaymentStep";
 import TopBar from "./components/TopBar";
 import VerdictStep from "./components/VerdictStep";
 import WorkingStep from "./components/WorkingStep";
-import { completion, latestQuote } from "./reducer";
+import { chosenProduct, completion, latestQuote } from "./reducer";
 import type { AppEvent, RunMode } from "./types";
 
 export type Step = "compose" | "working" | "verdict" | "payment";
@@ -21,6 +21,7 @@ export default function App() {
 
   const done = completion(events);
   const quote = latestQuote(events);
+  const product = chosenProduct(events);
 
   const start = useCallback(async (requestText: string, budgetRupees: number, runMode: RunMode) => {
     const token = ++runToken.current;
@@ -62,6 +63,7 @@ export default function App() {
   }, []);
 
   const goToPayment = useCallback(() => setStep("payment"), []);
+  const backToVerdict = useCallback(() => setStep("verdict"), []);
 
   return (
     <div className="page">
@@ -82,7 +84,15 @@ export default function App() {
         {step === "verdict" && <VerdictStep events={events} completion={done} onPay={goToPayment} onStartOver={startOver} />}
 
         {step === "payment" && quote && (
-          <PaymentStep amountPaise={quote.total_paise} request={request} mode={mode} onStartOver={startOver} />
+          <PaymentStep
+            amountPaise={quote.total_paise}
+            request={request}
+            mode={mode}
+            productTitle={product?.title ?? "your order"}
+            budgetPaise={quote.budget_paise}
+            onStartOver={startOver}
+            onBackToVerdict={backToVerdict}
+          />
         )}
       </main>
     </div>

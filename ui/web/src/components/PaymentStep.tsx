@@ -1,23 +1,32 @@
-// Step 4 — payment, then the final confirmation. On entry we ask the
-// backend for a payment target (POST /api/pay). In "Test run" mode, or
-// whenever no real Razorpay keys are configured, the backend hands back a
-// clearly-labelled simulated capture and this step shows a single
-// "Pay with netbanking (test)" button that completes it locally. When real
-// test-mode keys are active, the backend instead returns a real Razorpay
-// order and this step opens the actual Checkout.js netbanking flow.
-import { useEffect, useState } from "react";
+// Step 4 — an approval gate, then payment, then the final confirmation.
+// The FIRST thing shown on entry is the payment agent's approval dialog;
+// nothing is requested from the backend and no checkout opens until the
+// human approves. That approval, plus the mandate the Gate already
+// enforced, is the only authority this step acts on — the LLM never
+// touches this path. On approval we ask the backend for a payment target
+// (POST /api/pay). In "Test run" mode, or whenever no real Razorpay keys
+// are configured, the backend hands back a clearly-labelled simulated
+// capture and this step shows a single "Pay with netbanking (test)"
+// button that completes it locally. When real test-mode keys are active,
+// the backend instead returns a real Razorpay order and this step opens
+// the actual Checkout.js netbanking flow.
+import { useEffect, useRef, useState } from "react";
 import { confirmPayment, requestPayment, type PayResponse } from "../api";
 import { rupees } from "../format";
 import { loadRazorpayScript, openRazorpayCheckout } from "../razorpay";
 import type { RunMode } from "../types";
+import ApprovalDialog from "./ApprovalDialog";
 
-type Phase = "starting" | "awaiting" | "paying" | "done" | "failed";
+type Phase = "approval" | "starting" | "awaiting" | "paying" | "done" | "failed" | "cancelled";
 
 interface Props {
   amountPaise: number;
   request: string;
   mode: RunMode;
+  productTitle: string;
+  budgetPaise: number;
   onStartOver(): void;
+  onBackToVerdict(): void;
 }
 
 interface DoneState {
@@ -25,35 +34,67 @@ interface DoneState {
   amountPaise: number;
 }
 
-export default function PaymentStep({ amountPaise, request, mode, onStartOver }: Props) {
-  const [phase, setPhase] = useState<Phase>("starting");
+export default function PaymentStep({
+  amountPaise,
+  request,
+  mode,
+  productTitle,
+  budgetPaise,
+  onStartOver,
+  onBackToVerdict,
+}: Props) {
+  const [phase, setPhase] = useState<Phase>("approval");
   const [pay, setPay] = useState<PayResponse | null>(null);
   const [done, setDone] = useState<DoneState | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
+  const activeRef = useRef(true);
 
+  // Guards the async payment calls below against setting state after this
+  // step has been navigated away from. Set true on every effect run (not
+  // just via the useRef initialiser) because React 18 StrictMode's dev-only
+  // mount -> cleanup -> mount dance would otherwise leave this stuck false
+  // after the first mount, silently swallowing every later state update.
   useEffect(() => {
-    let cancelled = false;
-    setPhase("starting");
-    requestPayment(amountPaise, request, mode).then((res) => {
-      if (cancelled) return;
-      if (!res) {
-        setErrorText("Could not reach the payment endpoint.");
-        setPhase("failed");
-        return;
-      }
-      setPay(res);
-      setPhase("awaiting");
-    });
+    activeRef.current = true;
     return () => {
-      cancelled = true;
+      activeRef.current = false;
     };
-    // Runs once per entry into this step.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function startPayment() {
+    setPhase("starting");
+    const res = await requestPayment(amountPaise, request, mode);
+    if (!activeRef.current) return;
+    if (!res) {
+      setErrorText("Could not reach the payment endpoint.");
+      setPhase("failed");
+      return;
+    }
+    setPay(res);
+    // On approval the payment agent acts immediately: for a real test-mode
+    // order it opens the netbanking checkout itself (the human only completes
+    // the mock-bank Success). The "awaiting" panel with its button is then
+    // just the retry surface if the checkout is dismissed. The no-keys
+    // simulated path keeps its explicit button.
+    if (res.gateway === "razorpay" && res.key_id) {
+      void payRazorpay(res);
+    } else {
+      setPhase("awaiting");
+    }
+  }
+
+  function handleApprove() {
+    void startPayment();
+  }
+
+  function handleCancel() {
+    setPhase("cancelled");
+  }
 
   async function finish(orderId: string, paymentId?: string, signature?: string) {
     setPhase("paying");
     const confirmed = await confirmPayment(orderId, paymentId, signature);
+    if (!activeRef.current) return;
     if (!confirmed) {
       setErrorText("The payment went through, but the confirmation call failed.");
       setPhase("failed");
@@ -68,15 +109,16 @@ export default function PaymentStep({ amountPaise, request, mode, onStartOver }:
     await finish(pay.order_id);
   }
 
-  async function payRazorpay() {
-    if (!pay || !pay.key_id) return;
+  async function payRazorpay(target: PayResponse | null = pay) {
+    if (!target || !target.key_id) return;
+    setPhase("starting");
     try {
       await loadRazorpayScript();
       openRazorpayCheckout({
-        key: pay.key_id,
-        order_id: pay.order_id,
-        amount: pay.amount_paise,
-        currency: pay.currency,
+        key: target.key_id,
+        order_id: target.order_id,
+        amount: target.amount_paise,
+        currency: target.currency,
         name: "Vera",
         description: request,
         prefill: { method: "netbanking" },
@@ -127,7 +169,32 @@ export default function PaymentStep({ amountPaise, request, mode, onStartOver }:
     <section className="payment">
       <h1 className="payment__title">Payment</h1>
 
-      {(phase === "starting" || phase === "paying") && <p className="payment__status">Preparing the payment…</p>}
+      {phase === "approval" && (
+        <ApprovalDialog
+          amountPaise={amountPaise}
+          productTitle={productTitle}
+          budgetPaise={budgetPaise}
+          onApprove={handleApprove}
+          onCancel={handleCancel}
+        />
+      )}
+
+      {phase === "cancelled" && (
+        <div className="payment__cancelled">
+          <p>Payment cancelled — nothing was charged.</p>
+          <div className="payment__cancelled-actions">
+            <button className="btn" type="button" onClick={onBackToVerdict}>
+              Back to the verdict
+            </button>
+            <button className="btn" type="button" onClick={onStartOver}>
+              Start over
+            </button>
+          </div>
+        </div>
+      )}
+
+      {phase === "starting" && <p className="payment__status">Payment agent — opening secure netbanking…</p>}
+      {phase === "paying" && <p className="payment__status">Confirming the payment…</p>}
 
       {phase === "awaiting" && pay?.gateway === "test-sim" && (
         <div className="payment__panel">
