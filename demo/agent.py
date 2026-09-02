@@ -30,6 +30,7 @@ real Razorpay test mode.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 import config
 from demo.tools import build_tools, grant_intent
@@ -72,8 +73,161 @@ class RunResult:
     transcript: list[dict] = field(default_factory=list)
 
 
-def _event(transcript: list[dict], kind: str, **payload) -> None:
+# Transcript `kind` -> the schema `type` string the Day-3 event bus expects,
+# for the handful of kinds where the two names differ. Anything not listed
+# here forwards under its own kind name unchanged (intent_granted, tool_call,
+# tool_result all already match EVENT_SCHEMA.md).
+_KIND_TO_EVENT_TYPE = {"thought": "agent_thought"}
+
+
+def _event(
+    transcript: list[dict],
+    kind: str,
+    on_event: "Callable[..., None] | None" = None,
+    **payload,
+) -> None:
+    """Append one entry to the plain transcript, unchanged, AND -- when a live
+    observer is attached -- forward the same fact as a schema-shaped event.
+
+    The transcript entry's shape never changes here (same `kind`, same payload
+    keys) so the proof script and the existing tests, which key off both,
+    stay exactly as they were. Only the COPY handed to `on_event` gets
+    renamed to match `scratchpad/day3/EVENT_SCHEMA.md` (e.g. `tool_result`'s
+    `result` field becomes `result_text`), so the transcript and the live
+    feed can each use the name that suits their own reader.
+    """
     transcript.append({"kind": kind, **payload})
+    if on_event is None:
+        return
+    forward = dict(payload)
+    if kind == "tool_result" and "result" in forward:
+        forward["result_text"] = forward.pop("result")
+    try:
+        on_event(_KIND_TO_EVENT_TYPE.get(kind, kind), **forward)
+    except Exception:  # noqa: BLE001 — a bad observer must never break the run
+        pass
+
+
+def _emit_event(on_event: "Callable[..., None] | None", event_type: str, **payload) -> None:
+    """Send a richer, schema-only event with no transcript-`kind` analogue
+    (`intent_understood`, `search_results`, `merchant_quote`, `gate_result`,
+    `ledger_append`). Same never-break-the-run guarantee as `_event` above,
+    and the same non-mutation of the transcript: these facts live in the live
+    feed only, not in `RunResult.transcript`.
+    """
+    if on_event is None:
+        return
+    try:
+        on_event(event_type, **payload)
+    except Exception:  # noqa: BLE001 — a bad observer must never break the run
+        pass
+
+
+def _rupees_display(paise: int) -> str:
+    return f"₹{paise // 100:,}.{paise % 100:02d}"
+
+
+def _gate_checks(passed: bool, reason_code: str | None) -> list[dict]:
+    """Decompose one GateResult into the ordered per-check view
+    EVENT_SCHEMA.md wants, using `config.GATE_CHECK_SEQUENCE` +
+    `config.GATE_CODE_TO_CHECK` (derived straight from `merchant/gate.py`'s
+    real a-g check order). The real Gate returns ONE result and short-circuits
+    at the first failing check; this never re-runs it -- it only labels which
+    of the checks before the failure passed, and which ones after it never
+    ran, so the UI can render "green, green, RED, grey, grey, grey, grey".
+    """
+    if passed:
+        return [{"name": name, "status": "pass"} for name in config.GATE_CHECK_SEQUENCE]
+    fail_idx = config.GATE_CODE_TO_CHECK.get(reason_code or "", 0)
+    checks = []
+    for idx, name in enumerate(config.GATE_CHECK_SEQUENCE):
+        if idx < fail_idx:
+            status = "pass"
+        elif idx == fail_idx:
+            status = "fail"
+        else:
+            status = "pending"
+        checks.append({"name": name, "status": status})
+    return checks
+
+
+def _emit_ledger_append(on_event: "Callable[..., None] | None") -> None:
+    """Read the REAL ledger back after a Gate decision writes to it -- never
+    fabricate a row. If the ledger cannot be read in a given wiring, emit
+    nothing rather than a faked `ledger_append`."""
+    try:
+        from core import ledger as core_ledger
+
+        entries = core_ledger.all_entries()
+        chain = core_ledger.verify_chain()
+    except Exception:  # noqa: BLE001 — an unreadable ledger is a silent no-op, never a fake row
+        return
+    latest = entries[-1] if entries else None
+    _emit_event(
+        on_event,
+        "ledger_append",
+        rows=len(entries),
+        chain_ok=chain.ok,
+        latest_hash=(latest.entry_hash if latest else None),
+        latest_event=(latest.event_type if latest else None),
+    )
+
+
+def _emit_tool_side_effects(
+    on_event: "Callable[..., None] | None",
+    context,
+    name: str,
+    args: dict,
+    quote_id_before: str | None,
+    gate_result_before: object,
+) -> None:
+    """After a tool actually runs, surface the STRUCTURED data behind its
+    plain-string result as schema-shaped events, by reading it back off
+    `context` (which `demo/tools.py` stashes for exactly this) rather than
+    re-parsing the tool's return string.
+
+    The `before`/`after` comparisons (`quote_id_before`, `gate_result_before`)
+    are what stop a FAILED call (a bad price, a refused list, an unknown
+    tool) from re-emitting stale data left over from an earlier, successful
+    call on the same context.
+    """
+    if on_event is None:
+        return
+
+    if name == "web_search":
+        _emit_event(
+            on_event, "search_results",
+            query=args.get("query", ""),
+            candidates=list(context.last_candidates or []),
+        )
+        return
+
+    if name == "list_with_merchant":
+        if context.last_quote_id and context.last_quote_id != quote_id_before:
+            quote = context.quotes.get(context.last_quote_id)
+            if quote is not None:
+                _emit_event(
+                    on_event, "merchant_quote",
+                    quote_id=quote.quote_id,
+                    total_paise=quote.total_paise,
+                    total_display=_rupees_display(quote.total_paise),
+                    budget_paise=context.budget_paise,
+                )
+        return
+
+    if name == "sign_and_submit":
+        result = context.last_gate_result
+        if result is not None and result is not gate_result_before:
+            order_id = context.order.order_id if context.order is not None else None
+            _emit_event(
+                on_event, "gate_result",
+                passed=result.passed,
+                reason_code=result.reason_code,
+                checks=_gate_checks(result.passed, result.reason_code),
+                order_id=order_id,
+                total_paise=result.total_paise,
+            )
+            _emit_ledger_append(on_event)
 
 
 def run(
@@ -85,12 +239,21 @@ def run(
     search_fn=None,
     gateway=None,
     max_steps: int | None = None,
+    on_event: "Callable[..., None] | None" = None,
 ) -> RunResult:
     """Run the buyer brain end to end for one request under one budget.
 
     Returns a RunResult with an honest status. Raising is reserved for genuine
     programming errors — a "nothing fit" outcome is a normal, reported result,
     not an exception.
+
+    `on_event`, if given, is called with `(event_type: str, **payload)` --
+    the exact calling convention of `demo.events.EventBus.emit` -- once per
+    fact the Day-3 mission-control UI cares about (see
+    `scratchpad/day3/EVENT_SCHEMA.md`). It is a pure observer: any exception
+    it raises is swallowed, and it can never see, delay, or change anything
+    on the money path. `RunResult.transcript` is unaffected either way, so a
+    caller with no `on_event` sees byte-identical behaviour to before.
     """
     budget_paise = budget_rupees * 100
     transcript: list[dict] = []
@@ -117,6 +280,7 @@ def run(
             reason=f"could not understand a product to buy from '{request}'.",
             transcript=transcript,
         )
+    _emit_event(on_event, "intent_understood", category=category)
 
     # 2. The one consent step: mint the agent key, register the signed intent.
     context = grant_intent(
@@ -127,7 +291,8 @@ def run(
         gateway=gateway,
     )
     _event(transcript, "intent_granted", agent_id=context.agent_id, category=category,
-           budget_paise=budget_paise, intent_mandate_id=context.intent_mandate_id)
+           budget_paise=budget_paise, intent_mandate_id=context.intent_mandate_id,
+           on_event=on_event)
 
     # 3. Build the tools and bind them to the model.
     tools = build_tools(context)
@@ -176,7 +341,7 @@ def run(
 
         text = _message_text(ai)
         if text:
-            _event(transcript, "thought", text=text)
+            _event(transcript, "thought", text=text, on_event=on_event)
 
         tool_calls = getattr(ai, "tool_calls", None) or []
         if not tool_calls:
@@ -187,7 +352,12 @@ def run(
             name = call.get("name")
             args = call.get("args") or {}
             call_id = call.get("id") or name
-            _event(transcript, "tool_call", name=name, args=args)
+            _event(transcript, "tool_call", name=name, args=args, on_event=on_event)
+            # Snapshot BEFORE the tool runs, so a failed call (which leaves these
+            # context fields untouched) can never be mistaken for a fresh quote
+            # or a fresh Gate decision when _emit_tool_side_effects looks after.
+            quote_id_before = context.last_quote_id
+            gate_result_before = context.last_gate_result
             tool = tools_by_name.get(name)
             if tool is None:
                 out = f"Unknown tool {name!r}. Available: {', '.join(tools_by_name)}."
@@ -198,7 +368,8 @@ def run(
                     out = f"Bad arguments for {name}: {exc}"
                 except Exception as exc:  # noqa: BLE001 — a tool bug must not kill the loop
                     out = f"Tool {name} errored: {type(exc).__name__}: {exc}"
-            _event(transcript, "tool_result", name=name, result=out)
+            _event(transcript, "tool_result", name=name, result=out, on_event=on_event)
+            _emit_tool_side_effects(on_event, context, name, args, quote_id_before, gate_result_before)
             messages.append(ToolMessage(content=out, tool_call_id=call_id))
 
     # Derive the honest status.

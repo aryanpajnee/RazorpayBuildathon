@@ -99,6 +99,17 @@ class ToolContext:
     summary: str | None = None
     order: object = None             # merchant.gateway.Order once a Gate PASS creates one
 
+    # --- Day-3: display/telemetry ONLY, for demo/agent.py's live event feed ---
+    # Neither field is ever read back into a money decision -- they exist so the
+    # agent loop can emit a structured `search_results` / `gate_result` event
+    # without re-parsing a tool's plain-string return. `last_candidates` is reset
+    # (to [] on failure, to the fresh list on success) on EVERY web_search call,
+    # so a later failed search can never leave a prior search's stale results
+    # sitting here to be re-emitted. `last_gate_result` is set for BOTH a pass
+    # and a refusal -- the UI's Gate visualisation needs the refusal shape too.
+    last_candidates: list[dict] | None = None
+    last_gate_result: object = None  # merchant.gate.GateResult once sign_and_submit has run
+
     def __post_init__(self) -> None:
         if self.search_fn is None:
             self.search_fn = web_search
@@ -257,7 +268,21 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
         try:
             results = list(context.search_fn(query))[: config.SEARCH_MAX_RESULTS]
         except Exception as exc:  # noqa: BLE001 — a search failure must not kill the run
+            context.last_candidates = []  # never leave a stale prior result set behind
             return f"Search failed ({type(exc).__name__}). Try a different query."
+        # Stashed for demo/agent.py's `search_results` event — structured, so the
+        # UI never has to re-parse `_format_candidates`'s display string.
+        context.last_candidates = [
+            {
+                "title": r.title,
+                "seller": r.seller,
+                "price_display": r.price_display,
+                "price_paise": r.price_paise,
+                "url": r.url,
+                "source": r.source,
+            }
+            for r in results
+        ]
         return _format_candidates(results)
 
     def open_product_tool(url: str) -> str:
@@ -357,6 +382,9 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
         )
         envelope = sign(cart_payload, context.sk)
         result = gate_check(envelope)
+        # Stashed for demo/agent.py's `gate_result` event -- BOTH outcomes, since
+        # a refusal's decomposed checks are exactly what the UI wants to show red.
+        context.last_gate_result = result
 
         if not result.passed:
             return (
