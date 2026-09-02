@@ -1,6 +1,6 @@
-"""FastAPI backend for the Day-3 mission-control dashboard.
+"""FastAPI backend for Vera, the Day-3 buyer console.
 
-The React console POSTs one request+budget here and watches the REAL
+The React app POSTs one request+budget here and watches the REAL
 autonomous buyer run live: `demo.orchestrator.run_streamed` drives
 `demo.agent.run` on a worker thread and streams every event it emits back
 over Server-Sent Events, framed exactly as `scratchpad/day3/EVENT_SCHEMA.md`
@@ -9,18 +9,28 @@ this file computes a total, verifies a signature, or decides pass/refuse --
 it only serves the built React app and turns one HTTP request into one live
 event stream from the real agent + the real merchant + the real Gate.
 
+This file also owns Vera's own demo-facing checkout step (`/api/pay`,
+`/api/pay/confirm`) -- separate from the frozen money path above, which has
+already run a cart through the mandate/Gate/webhook flow to completion by
+the time a run reaches Verdict. Paying is a second, independent action a
+person takes afterwards, so it gets its own pair of endpoints rather than
+reusing quote_id/order_id machinery meant for the mandate-enforced cart.
+
     uv run uvicorn ui.server:app --port 8100
 
 Endpoints:
-    POST /api/run     -> SSE stream of one buyer run's events
-    POST /api/reset    -> wipe the demo's ledger/quote/intent/order state
-    GET  /api/health   -> {"ok": true, "dist_built": <bool>}
-    GET  /             -> the built React app (ui/web/dist), or a "not built" page
+    POST /api/run          -> SSE stream of one buyer run's events
+    POST /api/reset         -> wipe the demo's ledger/quote/intent/order state
+    POST /api/pay           -> create a payment target (real or simulated test-mode)
+    POST /api/pay/confirm   -> record the demo's own payment confirmation
+    GET  /api/health        -> {"ok": true, "dist_built": <bool>}
+    GET  /                  -> the built React app (ui/web/dist), or a "not built" page
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -31,7 +41,7 @@ from pydantic import BaseModel
 import config
 from demo import orchestrator
 
-app = FastAPI(title="Northwind Mission Control")
+app = FastAPI(title="Vera")
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -83,6 +93,80 @@ def reset() -> dict:
         path: Path = getattr(config, name)
         path.unlink(missing_ok=True)
     return {"ok": True}
+
+
+class PayBody(BaseModel):
+    amount_paise: int
+    request: str
+    mode: str = config.UI_DEFAULT_MODE
+
+
+def _simulated_payment(amount_paise: int) -> dict:
+    """A clearly-labelled simulated test capture -- no external call. Used only
+    when there are no real Razorpay keys on file (`config.USE_FAKE_GATEWAY`), and
+    as the fallback if a real gateway call fails, so this demo step never
+    dead-ends. Note: a Razorpay TEST-MODE order is itself a test (no real money),
+    so the payment step reaches real netbanking even from a "Test run" agent
+    pass whenever keys are present -- that is the gateway behaviour we want to
+    exercise on camera."""
+    return {
+        "gateway": "test-sim",
+        "order_id": f"test_sim_{uuid.uuid4().hex[:12]}",
+        "amount_paise": amount_paise,
+        "currency": config.CURRENCY,
+    }
+
+
+@app.post("/api/pay")
+def pay(body: PayBody) -> dict:
+    """Create a payment target for Vera's own checkout step.
+
+    This is deliberately NOT the frozen money path's `merchant.gateway.create_order`
+    (which ties a quote_id to an idempotent order record for the mandate-enforced
+    cart) -- by the time a run reaches this step, that cart has already cleared
+    the Gate. This endpoint creates a second, independent Razorpay test-mode
+    order for the same amount so the demo can show the actual netbanking
+    checkout on camera, using `merchant.gateway.RazorpayGateway` directly."""
+    if config.USE_FAKE_GATEWAY:
+        return _simulated_payment(body.amount_paise)
+
+    try:
+        from merchant.gateway import RazorpayGateway
+
+        gateway = RazorpayGateway()
+        receipt = f"vera_{uuid.uuid4().hex[:10]}"
+        raw = gateway.create_order(body.amount_paise, config.CURRENCY, receipt, {"request": body.request})
+        return {
+            "gateway": "razorpay",
+            "order_id": raw["id"],
+            "key_id": config.RAZORPAY_KEY_ID,
+            "amount_paise": body.amount_paise,
+            "currency": config.CURRENCY,
+        }
+    except Exception:
+        # Never expose the key secret, and never let a gateway hiccup dead-end
+        # the demo -- fall back to the same simulated shape offline mode uses.
+        return _simulated_payment(body.amount_paise)
+
+
+class PayConfirmBody(BaseModel):
+    order_id: str
+    razorpay_payment_id: str | None = None
+    razorpay_signature: str | None = None
+
+
+@app.post("/api/pay/confirm")
+def pay_confirm(body: PayConfirmBody) -> dict:
+    """Record Vera's own demo payment confirmation. Deliberately NOT a
+    reimplementation of the frozen webhook/signature-verify path in
+    `merchant/webhooks.py` (unchanged, untouched) -- this just closes out the
+    UI's own checkout step for display."""
+    return {
+        "status": "paid",
+        "order_id": body.order_id,
+        "method": "netbanking",
+        "test_mode": True,
+    }
 
 
 @app.get("/api/health")

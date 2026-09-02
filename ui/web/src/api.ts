@@ -83,3 +83,63 @@ export async function resetLedger(): Promise<boolean> {
     return false;
   }
 }
+
+// -- Payment (POST /api/pay, POST /api/pay/confirm) --------------------
+// A demo-facing pair of endpoints, separate from the frozen money path:
+// this is Vera's own checkout step, not the mandate/Gate/webhook flow
+// (that already ran to completion before the buyer ever reaches Verdict).
+
+export interface PayResponse {
+  gateway: "test-sim" | "razorpay";
+  order_id: string;
+  key_id?: string;
+  amount_paise: number;
+  currency: string;
+}
+
+export async function requestPayment(
+  amountPaise: number,
+  request: string,
+  mode: RunMode,
+): Promise<PayResponse | null> {
+  try {
+    const res = await fetch("/api/pay", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ amount_paise: amountPaise, request, mode }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as PayResponse;
+  } catch {
+    return null;
+  }
+}
+
+export interface ConfirmResponse {
+  status: string;
+  order_id: string;
+  method: string;
+  test_mode: boolean;
+}
+
+export async function confirmPayment(
+  orderId: string,
+  razorpayPaymentId?: string,
+  razorpaySignature?: string,
+): Promise<ConfirmResponse | null> {
+  try {
+    const res = await fetch("/api/pay/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        order_id: orderId,
+        razorpay_payment_id: razorpayPaymentId,
+        razorpay_signature: razorpaySignature,
+      }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as ConfirmResponse;
+  } catch {
+    return null;
+  }
+}
