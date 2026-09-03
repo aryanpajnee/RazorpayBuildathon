@@ -7,10 +7,14 @@ import { useEffect, useRef } from "react";
 import type { KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { rupees } from "../format";
+import ProductCard from "./ProductCard";
 
 interface Props {
   amountPaise: number;
   productTitle: string;
+  productSeller?: string | null;
+  productPriceDisplay?: string | null;
+  productUrl?: string | null;
   budgetPaise: number;
   onApprove(): void;
   onCancel(): void;
@@ -18,7 +22,16 @@ interface Props {
 
 const TITLE_ID = "approval-dialog-title";
 
-export default function ApprovalDialog({ amountPaise, productTitle, budgetPaise, onApprove, onCancel }: Props) {
+export default function ApprovalDialog({
+  amountPaise,
+  productTitle,
+  productSeller,
+  productPriceDisplay,
+  productUrl,
+  budgetPaise,
+  onApprove,
+  onCancel,
+}: Props) {
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Focus moves into the dialog on open and returns to whatever had focus
@@ -89,9 +102,15 @@ export default function ApprovalDialog({ amountPaise, productTitle, budgetPaise,
         <h2 id={TITLE_ID} className="approval-dialog__title">
           Approve this payment?
         </h2>
+        <ProductCard
+          title={productTitle}
+          seller={productSeller}
+          priceDisplay={productPriceDisplay}
+          url={productUrl}
+          compact
+        />
         <p className="approval-dialog__line">
-          Pay <span className="mono">{rupees(amountPaise)}</span> for <strong>{productTitle}</strong> via netbanking ·
-          test mode.
+          Pay <span className="mono">{rupees(amountPaise)}</span> for this via netbanking · test mode.
         </p>
         <p className="approval-dialog__context">
           That&rsquo;s under your signed budget of <span className="mono">{rupees(budgetPaise)}</span>, and the merchant

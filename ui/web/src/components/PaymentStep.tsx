@@ -12,6 +12,8 @@ import { confirmPayment, requestPayment, type PayResponse } from "../api";
 import { rupees } from "../format";
 import type { RunMode } from "../types";
 import ApprovalDialog from "./ApprovalDialog";
+import ProductCard from "./ProductCard";
+import { stashPurchase } from "../purchaseStash";
 
 type Phase = "approval" | "starting" | "redirecting" | "awaiting" | "paying" | "done" | "failed" | "cancelled";
 
@@ -20,6 +22,9 @@ interface Props {
   request: string;
   mode: RunMode;
   productTitle: string;
+  productSeller?: string | null;
+  productPriceDisplay?: string | null;
+  productUrl?: string | null;
   budgetPaise: number;
   onStartOver(): void;
   onBackToVerdict(): void;
@@ -35,6 +40,9 @@ export default function PaymentStep({
   request,
   mode,
   productTitle,
+  productSeller,
+  productPriceDisplay,
+  productUrl,
   budgetPaise,
   onStartOver,
   onBackToVerdict,
@@ -58,7 +66,10 @@ export default function PaymentStep({
 
   async function startPayment() {
     setPhase("starting");
-    const res = await requestPayment(amountPaise, request, mode, window.location.origin);
+    const res = await requestPayment(amountPaise, request, mode, window.location.origin, {
+      title: productTitle,
+      url: productUrl ?? null,
+    });
     if (!activeRef.current) return;
     if (!res) {
       setErrorText("Could not reach the payment endpoint.");
@@ -66,6 +77,16 @@ export default function PaymentStep({
       return;
     }
     setPay(res);
+    // Remember what was bought before we leave for the gateway: the Razorpay
+    // redirect reloads this app from a fresh URL, so the event-derived product
+    // is gone by the time the buyer returns. The return screen reads this back.
+    stashPurchase({
+      title: productTitle,
+      seller: productSeller ?? null,
+      priceDisplay: productPriceDisplay ?? null,
+      url: productUrl ?? null,
+      amountPaise,
+    });
     if (res.gateway === "razorpay" && res.payment_url) {
       // Hand off to the gateway: a full-page redirect to Razorpay's hosted
       // payment page. The user pays there; Razorpay returns them to the app.
@@ -110,6 +131,12 @@ export default function PaymentStep({
           ✓
         </div>
         <h1 className="done__title">Done. Your order is on the way.</h1>
+        <ProductCard
+          title={productTitle}
+          seller={productSeller}
+          priceDisplay={productPriceDisplay}
+          url={productUrl}
+        />
         <dl className="receipt">
           <div className="receipt__row">
             <dt>Order ID</dt>
@@ -140,6 +167,9 @@ export default function PaymentStep({
         <ApprovalDialog
           amountPaise={amountPaise}
           productTitle={productTitle}
+          productSeller={productSeller}
+          productPriceDisplay={productPriceDisplay}
+          productUrl={productUrl}
           budgetPaise={budgetPaise}
           onApprove={handleApprove}
           onCancel={handleCancel}

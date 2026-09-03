@@ -611,6 +611,24 @@ fieldset:disabled .mode-toggle__option {
   font-size: 0.9rem;
 }
 
+.product-card__link {
+  display: inline-block;
+  margin-top: 10px;
+  color: var(--go);
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.product-card__link:hover {
+  text-decoration: underline;
+}
+
+.product-card--compact {
+  margin-bottom: 18px;
+  padding: 14px 16px;
+}
+
 .quote-summary {
   margin: 0 0 28px;
   border-top: 1px solid var(--line);

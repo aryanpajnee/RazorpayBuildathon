@@ -95,11 +95,17 @@ def reset() -> dict:
     return {"ok": True}
 
 
+class ProductInfo(BaseModel):
+    title: str | None = None
+    url: str | None = None
+
+
 class PayBody(BaseModel):
     amount_paise: int
     request: str
     mode: str = config.UI_DEFAULT_MODE
     origin: str | None = None  # where to send the browser back after the hosted payment
+    product: ProductInfo | None = None  # what Vera chose — shown on the gateway + receipt
 
 
 def _simulated_payment(amount_paise: int) -> dict:
@@ -140,14 +146,25 @@ def pay(body: PayBody) -> dict:
         import razorpay
 
         client = razorpay.Client(auth=(config.RAZORPAY_KEY_ID, config.RAZORPAY_KEY_SECRET))
+        product_title = body.product.title if body.product and body.product.title else body.request
         payload: dict = {
             "amount": body.amount_paise,
             "currency": config.CURRENCY,
             "accept_partial": False,
             "reference_id": f"vera_{uuid.uuid4().hex[:12]}",
-            "description": f"Vera — {body.request}"[:250],
+            "description": f"Vera — {product_title}"[:250],
             "reminder_enable": False,
         }
+        # Carry what Vera bought onto the Razorpay order: the product shows on
+        # the hosted gateway (via description) and is recorded on the payment
+        # (via notes).
+        notes: dict = {}
+        if body.product and body.product.title:
+            notes["product_title"] = body.product.title[:255]
+        if body.product and body.product.url:
+            notes["product_url"] = body.product.url[:255]
+        if notes:
+            payload["notes"] = notes
         if body.origin:
             payload["callback_url"] = f"{body.origin.rstrip('/')}/?vera_paid=1"
             payload["callback_method"] = "get"

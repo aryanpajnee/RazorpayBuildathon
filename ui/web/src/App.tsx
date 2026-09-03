@@ -2,10 +2,12 @@ import { useCallback, useRef, useState } from "react";
 import { resetLedger, runAgent } from "./api";
 import ComposeStep from "./components/ComposeStep";
 import PaymentStep from "./components/PaymentStep";
+import ProductCard from "./components/ProductCard";
 import TopBar from "./components/TopBar";
 import VerdictStep from "./components/VerdictStep";
 import WorkingStep from "./components/WorkingStep";
 import { chosenProduct, completion, latestGateResult, latestQuote } from "./reducer";
+import { clearStashedPurchase, readStashedPurchase } from "./purchaseStash";
 import type { AppEvent, RunMode } from "./types";
 
 export type Step = "compose" | "working" | "verdict" | "payment";
@@ -30,6 +32,7 @@ function readPaymentReturn(): PaymentReturn | null {
 
 export default function App() {
   const [paymentReturn] = useState(readPaymentReturn);
+  const [purchased] = useState(readStashedPurchase);
   const [step, setStep] = useState<Step>("compose");
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [streaming, setStreaming] = useState(false);
@@ -101,6 +104,7 @@ export default function App() {
 
   // Clear the Razorpay return params from the URL and go back to a fresh start.
   const clearReturn = useCallback(() => {
+    clearStashedPurchase();
     window.location.assign(window.location.pathname);
   }, []);
 
@@ -115,6 +119,14 @@ export default function App() {
                 ✓
               </div>
               <h1 className="done__title">Payment received. Your order is on the way.</h1>
+              {purchased && (
+                <ProductCard
+                  title={purchased.title}
+                  seller={purchased.seller}
+                  priceDisplay={purchased.priceDisplay}
+                  url={purchased.url}
+                />
+              )}
               <dl className="receipt">
                 {paymentReturn.paymentId && (
                   <div className="receipt__row">
@@ -173,6 +185,9 @@ export default function App() {
             request={request}
             mode={mode}
             productTitle={product?.title ?? "your order"}
+            productSeller={product?.seller ?? null}
+            productPriceDisplay={product?.webPriceDisplay ?? null}
+            productUrl={product?.url ?? null}
             budgetPaise={quote.budget_paise}
             onStartOver={startOver}
             onBackToVerdict={backToVerdict}

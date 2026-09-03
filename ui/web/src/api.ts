@@ -100,17 +100,23 @@ export interface PayResponse {
   currency: string;
 }
 
+export interface PayProduct {
+  title: string;
+  url?: string | null;
+}
+
 export async function requestPayment(
   amountPaise: number,
   request: string,
   mode: RunMode,
   origin?: string,
+  product?: PayProduct | null,
 ): Promise<PayResponse | null> {
   try {
     const res = await fetch("/api/pay", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ amount_paise: amountPaise, request, mode, origin }),
+      body: JSON.stringify({ amount_paise: amountPaise, request, mode, origin, product }),
     });
     if (!res.ok) return null;
     return (await res.json()) as PayResponse;
