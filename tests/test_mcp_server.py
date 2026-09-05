@@ -185,8 +185,8 @@ def test_checkout_over_limit_cart_is_refused_with_correct_code(merchant):
 def test_checkout_tampered_signing_key_is_refused_sig_invalid(merchant):
     """A cart mandate carrying the right intent_mandate_id and agent_id, but
     signed by a key OTHER than the one the intent bound -- the exact
-    agent-key-impersonation gap merchant/gate.py's fix closes (see
-    CLAUDE.md, 'Phase 6 already surfaced one real finding'). MCP must not
+    agent-key-impersonation gap merchant/gate.py's fix closes (the
+    red-team pass surfaced this as one real finding). MCP must not
     let this through any more leniently than the HTTP API does: same
     gate.check() call, same refusal."""
     quote = get_quote([{"sku": FOOTWEAR_SKU, "qty": 1}])

@@ -8,7 +8,7 @@ BREACH the merchant, or was it DEFENDED — is decided by `classify()`, a pure
 Python function over hard facts (`gate_result.passed`, `order_created`),
 never by a language model. Letting an LLM decide "breach vs refused" would be
 trusting a model for a security judgment, exactly the anti-pattern
-CLAUDE.md rules out for the money path ("The LLM never touches the money
+the money path forbids ("the LLM never touches the money
 path... authorization decisions"). A judge that can be talked out of a
 verdict by clever attack prose is not a judge, it is one more thing the red
 team could fool.

@@ -1,7 +1,7 @@
 """The nine canonical adversarial attacks for Track 01, Phase 6 red team.
 
 Each attack below is the deterministic, offline reproduction of one entry in
-the adversarial test suite promised by CLAUDE.md / plan.md: replay, quote
+the adversarial test suite promised by the design spec: replay, quote
 expiry, price drift, cart tamper, over-limit, forged signature, expired
 intent, payment-failure double-order, and ledger tamper. Seven of the nine
 are caught by `merchant.gate.check()` (a `GateResult` with a specific

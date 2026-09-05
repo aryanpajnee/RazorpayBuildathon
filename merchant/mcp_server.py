@@ -1,7 +1,7 @@
 """The Northwind merchant's MCP surface.
 
-Exposes the merchant to any MCP client (Claude Desktop, Claude Code, another
-agent) as three tools that mirror the merchant's own HTTP API one-for-one:
+Exposes the merchant to any MCP client (an IDE agent, a desktop assistant,
+another agent) as three tools that mirror the merchant's own HTTP API one-for-one:
 
     search_catalog(query)         -> GET  /catalog/search
     get_quote(items)              -> POST /quote
@@ -244,8 +244,8 @@ def main() -> None:
         "--transport",
         choices=["stdio", "streamable-http"],
         default="stdio",
-        help="MCP transport (default: stdio, for Claude Desktop/Claude Code's "
-        "local-process client model). 'streamable-http' serves over HTTP on "
+        help="MCP transport (default: stdio, for a local-process MCP client "
+        "model). 'streamable-http' serves over HTTP on "
         "config.MCP_HOST:config.MCP_PORT instead.",
     )
     args = parser.parse_args()

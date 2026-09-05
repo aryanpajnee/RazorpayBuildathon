@@ -156,8 +156,8 @@ LLM_RETRY_BACKOFF_BASE_SECONDS = 1.0
 # DuckDuckGo is keyless, so the chain always has a last resort that cannot run
 # out of credits.
 #
-# Serper leads DELIBERATELY, a considered deviation from the order CLAUDE.md's
-# "Web search rules" first sketched (Tavily-first). A live comparison (1 Sep) was
+# Serper leads DELIBERATELY, a considered deviation from the order the
+# web-search rules first sketched (Tavily-first). A live comparison (1 Sep) was
 # decisive for a SHOPPING agent: Serper's /shopping endpoint returns clean
 # structured ₹ prices AND the retailer name (Amazon.in, Flipkart, Decathlon, …),
 # so the buyer reasons over real buyable products; Tavily-first returned mostly
@@ -304,7 +304,7 @@ UI_STREAM_STEP_SECONDS = 0.5
 
 # --- Phase 7: MCP server + observability + UI -------------------------------
 # The merchant's MCP surface. `merchant/mcp_server.py` exposes the merchant to
-# any MCP client (Claude Desktop, Claude Code, another agent) as three tools —
+# any MCP client (an IDE agent, a desktop assistant, another agent) as three tools —
 # search_catalog, get_quote, checkout — thin adapters over the SAME money path
 # the HTTP API already guards. MCP is transport, never a bypass of the Gate.
 MCP_SERVER_NAME = "northwind-merchant"
@@ -385,7 +385,7 @@ UI_DEFAULT_MODE = "offline"
 # Ordered roster for the dashboard's left column — which agent/component
 # "lights up" as the run progresses. Purely DISPLAY metadata: no code path
 # reads `id` to route logic, it only labels events for the UI. Order follows
-# the canonical flow (CLAUDE.md): intent understanding -> consent -> the
+# the canonical flow: intent understanding -> consent -> the
 # buyer's own reasoning/search loop -> the merchant's offer+quote -> the
 # Gate -> the ledger.
 AGENT_ROSTER = (

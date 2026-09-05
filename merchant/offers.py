@@ -118,8 +118,8 @@ def map_to_category(text: str) -> str | None:
     Why no LLM: the Gate's category check is an exact-string comparison
     (`product["category"] != intent["category"]`) — a model's judgment call
     on "is a compression sleeve 'apparel' or 'recovery'?" is exactly the kind
-    of nondeterminism the money path forbids (CLAUDE.md: "The LLM never
-    touches the money path"). This function is intentionally dumb: first
+    of nondeterminism the money path forbids ("the LLM never touches the
+    money path"). This function is intentionally dumb: first
     keyword substring match wins, walked in `config.CATALOG_CATEGORIES`
     order so the result is stable even when a title matches more than one
     category's keywords (e.g. "recovery compression socks" hits both
