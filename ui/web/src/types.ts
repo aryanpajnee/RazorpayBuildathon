@@ -69,6 +69,18 @@ export interface MerchantQuote extends EventEnvelope {
   budget_paise: number;
 }
 
+// Display-only: which product the buyer listed with the merchant. Fields are
+// sourced from the real search candidate (authoritative web data), so the UI's
+// product link points at the exact listing chosen. Never a money input.
+export interface ProductChosen extends EventEnvelope {
+  type: "product_chosen";
+  title: string;
+  url: string;
+  seller: string | null;
+  price_display: string | null;
+  source: string;
+}
+
 export type CheckStatus = "pass" | "fail" | "pending";
 
 export interface GateCheck {
@@ -118,6 +130,7 @@ export type AppEvent =
   | ToolResult
   | SearchResults
   | MerchantQuote
+  | ProductChosen
   | GateResult
   | LedgerAppend
   | RunComplete

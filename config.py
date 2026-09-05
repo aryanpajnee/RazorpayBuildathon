@@ -54,7 +54,7 @@ NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com
 # Intent Compiler's understand step). It is NOT wired into the buyer's tool-calling
 # loop or anything numeric: it only understands the prompt, extracts what to buy,
 # and hands that label into the (unchanged) chain. See INTENT_PROVIDER below.
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 
 MODELS = {
@@ -104,6 +104,39 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # against these or the demo dies mid-run with a 429.
 GEMINI_RPM_LIMIT = 15
 GEMINI_DAILY_LIMIT = 1500
+
+# Groq free tier (llama-3.3-70b): ~30 req/min, ~1000 req/day, independent of
+# Gemini's quota. Whichever provider is guarded is guarded against ITS OWN
+# limits (see buyer/llm.py `_provider_limits`), so swapping which provider leads
+# never leaves the guard tuned for the wrong one.
+GROQ_RPM_LIMIT = int(os.getenv("GROQ_RPM_LIMIT", "30"))
+GROQ_DAILY_LIMIT = int(os.getenv("GROQ_DAILY_LIMIT", "1000"))
+
+# --- Fallback LLM lane -----------------------------------------------------
+# The gateway (buyer/llm.py) fails over ONCE to a second provider when the FRONT
+# provider (LLM_PROVIDER) is rate-limited or out of daily quota — never on a bad
+# request or a dead model (that's a bug and must surface, not be papered over).
+#
+# Which provider leads vs. catches is the whole point of the swap:
+#   * NOW, for live testing: LLM_PROVIDER=groq, FALLBACK_LLM_PROVIDER=gemini.
+#     Groq serves every call; Gemini only catches an exhausted Groq (which a few
+#     test runs never reach), so the Gemini free-tier quota is left WHOLE for the
+#     real submission recording.
+#   * FOR THE RECORDING: flip both — LLM_PROVIDER=gemini, FALLBACK_LLM_PROVIDER=
+#     groq — so Gemini leads and the second Groq key is the safety net.
+#
+# The fallback provider's KEY is resolved by provider in buyer/llm.py: groq ->
+# GROQ_API_KEY_FALLBACK (the dedicated second key, kept distinct from the
+# GROQ_API_KEY the intent step uses, so the two lanes never share a key), gemini
+# -> GEMINI_API_KEY, and so on. Like every LLM here the lane is structurally off
+# the money path: the Gate re-derives every price and re-verifies every
+# signature, so a degraded-but-alive fallback can only ever change which product
+# is picked or how a line reads, never whether a rupee moves. Point the fallback
+# at a provider with no configured key and there is simply no fallback — the
+# front provider's exhaustion propagates exactly as it did before the lane
+# existed.
+FALLBACK_LLM_PROVIDER = os.getenv("FALLBACK_LLM_PROVIDER", "gemini")
+GROQ_API_KEY_FALLBACK = os.getenv("GROQ_API_KEY_FALLBACK", "")
 
 # Retry budget for a single LLM call. Capped rather than unbounded: an agent
 # that retries forever burns the daily quota and hangs the demo instead of

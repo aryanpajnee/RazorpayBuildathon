@@ -252,12 +252,64 @@ class RateGuard:
         )
 
 
+def _provider_limits(provider: str) -> tuple[int, int]:
+    """(rpm_limit, daily_limit) for a provider's free tier. A provider guards
+    against ITS OWN limits, so whichever one leads (LLM_PROVIDER) or catches
+    (FALLBACK_LLM_PROVIDER) is throttled correctly after a swap. Providers with
+    no published free-tier number fall back to Gemini's conservative limits."""
+    limits = {
+        "gemini": (config.GEMINI_RPM_LIMIT, config.GEMINI_DAILY_LIMIT),
+        "groq": (config.GROQ_RPM_LIMIT, config.GROQ_DAILY_LIMIT),
+    }
+    return limits.get(provider, (config.GEMINI_RPM_LIMIT, config.GEMINI_DAILY_LIMIT))
+
+
+def _fallback_api_key(provider: str) -> str:
+    """The key the fallback lane uses for a given provider. Groq's fallback is
+    the DEDICATED second key (GROQ_API_KEY_FALLBACK), never the one the intent
+    step uses, so the front and fallback lanes never share a key; every other
+    provider uses its normal configured key."""
+    if provider == "groq":
+        return config.GROQ_API_KEY_FALLBACK
+    return {
+        "gemini": config.GEMINI_API_KEY,
+        "nvidia": config.NVIDIA_API_KEY,
+        "anthropic": config.ANTHROPIC_API_KEY,
+        "openai": config.OPENAI_API_KEY,
+    }.get(provider, "")
+
+
 def default_rate_guard() -> RateGuard:
-    """The guard every agent surface shares unless a test injects its own."""
-    return RateGuard(
-        rpm_limit=config.GEMINI_RPM_LIMIT,
-        daily_limit=config.GEMINI_DAILY_LIMIT,
-    )
+    """The guard every agent surface shares unless a test injects its own —
+    tuned to the FRONT provider's own limits (config.LLM_PROVIDER)."""
+    rpm, daily = _provider_limits(config.LLM_PROVIDER)
+    return RateGuard(rpm_limit=rpm, daily_limit=daily)
+
+
+def default_fallback_guard() -> RateGuard:
+    """The guard the fallback lane uses — SEPARATE from the primary guard on
+    purpose. When we fail over because the front provider's daily quota is spent,
+    the primary guard's day window is already full; routing the fallback's calls
+    through it too would re-raise `DailyBudgetExceededError` on the very first
+    fallback call. The fallback provider's quota is independent, so its lane gets
+    its own budget, tuned to that provider's own limits."""
+    rpm, daily = _provider_limits(config.FALLBACK_LLM_PROVIDER)
+    return RateGuard(rpm_limit=rpm, daily_limit=daily)
+
+
+def fallback_target() -> tuple[str, str] | None:
+    """(provider, api_key) for the emergency fallback lane, or None when the
+    fallback provider is unknown or has no key configured — in which case the
+    gateway behaves exactly as it did before the lane existed. Read at call time
+    so a test (or a mid-session provider swap) is seen without rebuilding the
+    gateway."""
+    provider = config.FALLBACK_LLM_PROVIDER
+    if not provider or provider not in _VALID_PROVIDERS:
+        return None
+    key = _fallback_api_key(provider)
+    if not key:
+        return None
+    return provider, key
 
 
 # --- chat model factory ----------------------------------------------------------------
@@ -277,15 +329,21 @@ def get_chat_model(**overrides):
 
     model_name = overrides.pop("model", config.MODELS[provider])
     temperature = overrides.pop("temperature", config.TEMPERATURE)
+    # An explicit `api_key` override lets the gateway build a model on the
+    # FALLBACK credentials (same provider, a different key) without a second
+    # config provider entry. Absent, each branch uses its configured key as
+    # before, so nothing about the default path changes.
+    api_key_override = overrides.pop("api_key", None)
 
     if provider == "gemini":
-        if not config.GEMINI_API_KEY:
+        key = api_key_override or config.GEMINI_API_KEY
+        if not key:
             raise MissingAPIKeyError("gemini", "GEMINI_API_KEY")
         from langchain_google_genai import ChatGoogleGenerativeAI
 
         return ChatGoogleGenerativeAI(
             model=model_name,
-            google_api_key=config.GEMINI_API_KEY,
+            google_api_key=key,
             temperature=temperature,
             **overrides,
         )
@@ -295,13 +353,14 @@ def get_chat_model(**overrides):
         # client reaches it with a custom base_url. This is the fast lane for
         # prose-only surfaces (see config.FAST_LLM_SURFACES); nothing numeric is
         # ever routed here, so the 8B's paise-scaling weakness cannot bite.
-        if not config.NVIDIA_API_KEY:
+        key = api_key_override or config.NVIDIA_API_KEY
+        if not key:
             raise MissingAPIKeyError("nvidia", _NVIDIA_API_KEY_ENV)
         from langchain_openai import ChatOpenAI
 
         return ChatOpenAI(
             model=model_name,
-            api_key=config.NVIDIA_API_KEY,
+            api_key=key,
             base_url=config.NVIDIA_BASE_URL,
             temperature=temperature,
             **overrides,
@@ -309,22 +368,24 @@ def get_chat_model(**overrides):
 
     if provider == "groq":
         # GroqCloud speaks the OpenAI wire protocol, so the OpenAI client reaches
-        # it with Groq's base_url. Used ONLY by the prompt-understanding step
-        # (demo/intent.py); never the tool-calling loop or a numeric surface.
-        if not config.GROQ_API_KEY:
+        # it with Groq's base_url. Two callers: the prompt-understanding step
+        # (demo/intent.py, on GROQ_API_KEY), and the emergency fallback lane
+        # (config.FALLBACK_LLM_*), which passes the second key as `api_key`.
+        key = api_key_override or config.GROQ_API_KEY
+        if not key:
             raise MissingAPIKeyError("groq", _GROQ_API_KEY_ENV)
         from langchain_openai import ChatOpenAI
 
         return ChatOpenAI(
             model=model_name,
-            api_key=config.GROQ_API_KEY,
+            api_key=key,
             base_url=config.GROQ_BASE_URL,
             temperature=temperature,
             **overrides,
         )
 
     if provider == "anthropic":
-        api_key = config.ANTHROPIC_API_KEY
+        api_key = api_key_override or config.ANTHROPIC_API_KEY
         if not api_key:
             raise MissingAPIKeyError("anthropic", _ANTHROPIC_API_KEY_ENV)
         from langchain_anthropic import ChatAnthropic
@@ -334,7 +395,7 @@ def get_chat_model(**overrides):
         )
 
     # provider == "openai": the only remaining option in _VALID_PROVIDERS.
-    api_key = config.OPENAI_API_KEY
+    api_key = api_key_override or config.OPENAI_API_KEY
     if not api_key:
         raise MissingAPIKeyError("openai", _OPENAI_API_KEY_ENV)
     from langchain_openai import ChatOpenAI
@@ -387,6 +448,7 @@ class LLMGateway:
         model=None,
         *,
         guard: RateGuard | None = None,
+        fallback_guard: RateGuard | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         backoff_base_seconds: float = DEFAULT_BACKOFF_BASE_SECONDS,
         sleep_fn=time.sleep,
@@ -402,6 +464,11 @@ class LLMGateway:
         self._backoff_base_seconds = backoff_base_seconds
         self._sleep_fn = sleep_fn
         self._purpose_counts: Counter[str] = Counter()
+        # The emergency fallback lane (config.FALLBACK_LLM_*): built lazily the
+        # first time a failover is actually needed, so a gateway that never
+        # exhausts its primary never touches the second key.
+        self._fallback_guard = fallback_guard
+        self._fallback_model = None
 
     def _provider_model(self, provider: str):
         """Lazily build and cache the chat model for one explicit provider."""
@@ -419,27 +486,66 @@ class LLMGateway:
         return self._provider_model(provider_for_purpose(purpose))
 
     def invoke(self, messages, *, purpose: str):
-        """Call the underlying model, guarded and retried.
+        """Call the underlying model, guarded and retried, with an emergency
+        cross-key failover.
 
-        Every attempt — including retries — goes back through the rate
-        guard first: a retry storm that skips the limiter would defeat the
-        whole point of having one. A `DailyBudgetExceededError` from the
-        guard is never retried; it propagates immediately.
+        The primary path runs the guarded retry loop against the routed (or
+        injected) model. If that path signals the provider is RATE-LIMITED or
+        out of daily quota — `DailyBudgetExceededError` from the guard, or
+        `RetryBudgetExceededError` after transient (429/503) retries are spent —
+        and a fallback key is configured, the whole call is re-run ONCE on the
+        fallback lane (config.FALLBACK_LLM_*, its own key and its own guard).
+        A non-transient error (a bug, an auth failure, a dead model) is never a
+        reason to fail over: it propagates so it can be seen and fixed.
+
+        An injected explicit model (tests, single-provider callers) has no
+        routing and no fallback lane — there is no second key to swap in for one
+        specific model object — so it runs the primary path alone.
         """
-        # Resolve provider + model once so retries stay on one provider. An
-        # injected explicit model (tests, single-provider callers) overrides
-        # routing and has nowhere to degrade to; `provider is None` marks that.
         if self._explicit_model is not None:
-            model = self._explicit_model
-            provider: str | None = None
-        else:
-            provider = provider_for_purpose(purpose)
-            model = self._provider_model(provider)
+            return self._run_attempts(
+                messages, self._explicit_model, None, self._guard, purpose,
+                allow_degrade=False,
+            )
 
+        provider = provider_for_purpose(purpose)
+        model = self._provider_model(provider)
+        try:
+            return self._run_attempts(
+                messages, model, provider, self._guard, purpose,
+                allow_degrade=True,
+            )
+        except (DailyBudgetExceededError, RetryBudgetExceededError):
+            fallback = self._fallback_lane()
+            if fallback is None:
+                raise  # no fallback configured: original exhaustion stands
+            fb_model, fb_provider, fb_guard = fallback
+            # One shot on the fallback lane. It has nowhere further to degrade,
+            # so its own exhaustion (or any error) propagates unwrapped.
+            return self._run_attempts(
+                messages, fb_model, fb_provider, fb_guard, purpose,
+                allow_degrade=False,
+            )
+
+    def _run_attempts(self, messages, model, provider, guard, purpose, *, allow_degrade):
+        """The guarded retry loop against ONE model/guard pair.
+
+        Returns the model's result, or raises: `DailyBudgetExceededError` (quota
+        gone — from the guard, never retried), `RetryBudgetExceededError`
+        (transient retries exhausted), or a non-transient error unchanged.
+
+        Every attempt — including retries — goes back through the rate guard
+        first: a retry storm that skips the limiter would defeat the whole point
+        of having one.
+
+        `allow_degrade` enables the ONE-TIME fast-lane -> default-provider
+        degrade on a non-transient failure (see below); it is off on the
+        fallback lane, which is already the last resort.
+        """
         degraded = False
         last_error: BaseException | None = None
         for attempt in range(1, self._max_attempts + 1):
-            self._guard.acquire()
+            guard.acquire()
             self._purpose_counts[purpose] += 1
             try:
                 return model.invoke(messages)
@@ -462,7 +568,12 @@ class LLMGateway:
                 # lane, so degrading to Gemini here never puts a numeric task on
                 # a model that shouldn't do arithmetic — the routing already
                 # guaranteed that upstream.
-                if not degraded and provider is not None and provider != config.LLM_PROVIDER:
+                if (
+                    allow_degrade
+                    and not degraded
+                    and provider is not None
+                    and provider != config.LLM_PROVIDER
+                ):
                     degraded = True
                     last_error = exc
                     model = self._provider_model(config.LLM_PROVIDER)
@@ -471,6 +582,20 @@ class LLMGateway:
 
         assert last_error is not None  # the loop always sets this before exiting
         raise RetryBudgetExceededError(self._max_attempts, last_error)
+
+    def _fallback_lane(self):
+        """(model, provider, guard) for the fallback lane, or None when no
+        fallback key is configured. Model and guard are built once and cached,
+        so repeated failovers in a session reuse the same client and budget."""
+        target = fallback_target()
+        if target is None:
+            return None
+        provider, key = target
+        if self._fallback_model is None:
+            self._fallback_model = get_chat_model(provider=provider, api_key=key)
+        if self._fallback_guard is None:
+            self._fallback_guard = default_fallback_guard()
+        return self._fallback_model, provider, self._fallback_guard
 
     @property
     def purpose_counts(self) -> dict[str, int]:

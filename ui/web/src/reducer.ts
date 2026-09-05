@@ -14,6 +14,7 @@ import type {
   IntentUnderstood,
   LedgerAppend,
   MerchantQuote,
+  ProductChosen,
   RunComplete,
   RunError,
   SearchResults,
@@ -188,6 +189,22 @@ export interface ChosenProduct {
 }
 
 export function chosenProduct(events: AppEvent[]): ChosenProduct | undefined {
+  // Preferred: the backend's authoritative `product_chosen` event, whose fields
+  // come from the real search candidate — so the link is the exact listing, not
+  // whatever the model happened to echo back into its tool args.
+  const chosen = latestOf<ProductChosen>(events, "product_chosen");
+  if (chosen) {
+    return {
+      title: chosen.title || "Unknown item",
+      seller: chosen.seller ?? null,
+      webPriceDisplay: chosen.price_display ?? null,
+      url: chosen.url || "",
+      source: chosen.source || "web",
+    };
+  }
+
+  // Fallback for older streams with no `product_chosen`: derive from the
+  // list_with_merchant tool_call's own args, matched to a search candidate.
   let call: ToolCall | undefined;
   for (const e of events) {
     if (e.type === "tool_call" && e.name === "list_with_merchant") call = e;

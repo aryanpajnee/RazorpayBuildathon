@@ -29,6 +29,7 @@ real Razorpay test mode.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -46,7 +47,9 @@ are added).
 Work in this order, using ONLY your tools:
 1. web_search to find candidates for the user's request.
 2. Pick the best fit that is comfortably under {budget_display}. If a good candidate
-   has no price, open_product to check it.
+   has no price, open_product to check it. If every priced option is above
+   {budget_display}, do not pretend one fits: call finish and explicitly say that
+   every priced option is above the signed budget.
 3. list_with_merchant to have Northwind relist your pick and quote its real total.
 4. sign_and_submit to send it to the Gate.
 5. If the Gate PASSES, call finish. If it REFUSES (e.g. OVER_LIMIT), call
@@ -440,6 +443,19 @@ def run(
             _emit_tool_side_effects(on_event, context, name, args, quote_id_before, gate_result_before)
             messages.append(ToolMessage(content=out, tool_call_id=call_id))
 
+    # Search prices are advisory rather than authoritative, but when every priced
+    # result is already above the signed ceiling we can state that no-buy reason
+    # deterministically. This keeps the user-facing verdict explicit even if the
+    # model ends with vague prose such as "I couldn't find something for you".
+    # It does not authorise or refuse payment; only the merchant Gate can do that.
+    over_budget_reason = _all_priced_candidates_over_budget_reason(
+        context.last_candidates, budget_paise
+    )
+    exact_match_reason = _exact_match_unavailable_reason(
+        request, context.last_candidates
+    )
+    no_buy_reason = over_budget_reason or exact_match_reason
+
     # Derive the honest status.
     if context.order is not None:
         result = RunResult(
@@ -452,7 +468,7 @@ def run(
     elif context.finished:
         result = RunResult(
             status="no_fit",
-            reason=context.summary or "The agent finished without placing an order.",
+            reason=no_buy_reason or context.summary or "The agent finished without placing an order.",
         )
     elif model_error is not None:
         # The run ended because a model turn raised (see the loop's try/except).
@@ -463,36 +479,114 @@ def run(
         if _is_malformed_tool_call(model_error):
             result = RunResult(
                 status="no_fit",
-                reason=f"Vera stopped without ordering — it could not settle on a "
-                       f"purchase within the signed ₹{budget_paise // 100:,} budget.",
+                reason=no_buy_reason or (
+                    f"Vera stopped without ordering — it could not settle on a "
+                    f"purchase within the signed ₹{budget_paise // 100:,} budget."
+                ),
             )
         else:
             result = RunResult(
-                status="stopped",
-                reason=f"The buyer model failed mid-run "
-                       f"({type(model_error).__name__}); nothing was ordered.",
+                status="no_fit" if no_buy_reason else "stopped",
+                reason=no_buy_reason or (
+                    f"The buyer model failed mid-run "
+                    f"({type(model_error).__name__}); nothing was ordered."
+                ),
             )
     elif hit_llm_budget:
         result = RunResult(status="llm_budget_exhausted",
                            reason=f"Stopped: hit the per-run model-call budget ({config.AGENT_MAX_LLM_CALLS}).")
     elif turns >= step_cap:
         result = RunResult(status="step_cap",
-                           reason=f"Stopped: hit the step cap ({step_cap}) without an order.")
+                           reason=no_buy_reason or
+                                  f"Stopped: hit the step cap ({step_cap}) without an order.")
     else:
         # The model ended with a plain message instead of a `finish` tool call
         # (no order, no cap hit). In a shopping run that is a no-buy outcome; give
         # it a budget-aware reason so the Verdict explains itself even when the
         # model did not phrase its own summary.
         result = RunResult(
-            status="stopped",
-            reason=f"Vera ended the run without a purchase within the signed "
-                   f"₹{budget_paise // 100:,} budget.",
+            status="no_fit" if no_buy_reason else "stopped",
+            reason=no_buy_reason or (
+                f"Vera ended the run without a purchase within the signed "
+                f"₹{budget_paise // 100:,} budget."
+            ),
         )
 
     result.steps = turns
     result.llm_calls = llm_calls
     result.transcript = transcript
     return result
+
+
+def _all_priced_candidates_over_budget_reason(
+    candidates: list[dict] | None,
+    budget_paise: int,
+) -> str | None:
+    """Return an explicit no-buy reason when every known price exceeds budget.
+
+    Unpriced search results are deliberately excluded from the claim, hence the
+    wording "priced option". Prices remain search evidence only; the function
+    never feeds a payment decision and the Gate remains the sole authority.
+    """
+    priced = [
+        candidate["price_paise"]
+        for candidate in candidates or []
+        if isinstance(candidate.get("price_paise"), int)
+        and not isinstance(candidate.get("price_paise"), bool)
+    ]
+    if not priced or any(price <= budget_paise for price in priced):
+        return None
+
+    cheapest = min(priced)
+    return (
+        "Vera refused to buy because every priced option found was above your "
+        f"signed {_rupees_display(budget_paise)} budget. The cheapest option found "
+        f"was {_rupees_display(cheapest)}. Nothing was ordered."
+    )
+
+
+_EXACT_ONLY_MARKERS = ("exact model only", "exact product only", "do not substitute")
+_REQUEST_FILLER = frozenset({
+    "a", "an", "the", "buy", "get", "me", "one", "please", "brand", "new",
+})
+
+
+def _exact_match_unavailable_reason(
+    request: str,
+    candidates: list[dict] | None,
+) -> str | None:
+    """Explain a non-budget refusal for an explicit exact-product constraint.
+
+    This is deliberately narrow: it activates only when the user expressly says
+    not to substitute, then requires every meaningful word before that constraint
+    to occur in one live result title. It never guesses availability for ordinary
+    requests and never participates in the money path.
+    """
+    lowered = request.lower()
+    marker_positions = [lowered.find(marker) for marker in _EXACT_ONLY_MARKERS if marker in lowered]
+    if not marker_positions or not candidates:
+        return None
+
+    requested_text = request[:min(marker_positions)].strip(" ,;:-")
+    required = [
+        token
+        for token in re.findall(r"[a-z0-9]+", requested_text.lower().replace("-", " "))
+        if token not in _REQUEST_FILLER
+    ]
+    if not required:
+        return None
+
+    for candidate in candidates:
+        title_tokens = set(re.findall(r"[a-z0-9]+", str(candidate.get("title", "")).lower()))
+        if all(token in title_tokens for token in required):
+            return None
+
+    requested_name = " ".join(required)
+    return (
+        f"Vera refused to buy because none of the live results matched the exact "
+        f"requested product ({requested_name}). The budget was not the issue, "
+        "and substitutions were not allowed. Nothing was ordered."
+    )
 
 
 _MALFORMED_TOOL_CALL_MARKERS = (

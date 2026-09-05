@@ -23,6 +23,7 @@ config.WEBHOOK_EVENTS_DB = _tmp / "webhook_events.db"
 import pytest  # noqa: E402
 
 from demo import agent, fixtures  # noqa: E402
+from demo.search import SearchResult  # noqa: E402
 from merchant import offers  # noqa: E402
 from merchant.gateway import FakeGateway  # noqa: E402
 
@@ -151,3 +152,86 @@ def test_generic_model_error_is_reported_not_over_claimed():
     assert res.order_id is None
     assert gw.calls == 0
     assert "ConnectionError" in res.reason
+
+
+def test_all_macbook_options_over_15000_get_an_explicit_budget_refusal():
+    """Regression: a vague model finish must not hide the obvious budget fact."""
+    macbooks = [
+        SearchResult(
+            title="MacBook Pro 13-inch",
+            url="https://example-shop.test/macbook-pro-13",
+            price_paise=7_999_000,
+            price_display="₹79,990",
+            seller="ExampleMart",
+            source="fixture",
+            snippet="MacBook Pro",
+        ),
+        SearchResult(
+            title="MacBook Pro 14-inch",
+            url="https://example-shop.test/macbook-pro-14",
+            price_paise=14_990_000,
+            price_display="₹1,49,900",
+            seller="ExampleMart",
+            source="fixture",
+            snippet="MacBook Pro",
+        ),
+    ]
+    model = fixtures.ScriptedModel(
+        turns=[
+            [{"name": "web_search", "args": {"query": "MacBook Pro"}, "id": "search"}],
+            [{"name": "finish", "args": {"summary": "I couldn't find something for you."}, "id": "finish"}],
+        ]
+    )
+
+    res = agent.run(
+        "MacBook Pro",
+        15_000,
+        category="laptop",
+        model=model,
+        search_fn=lambda query: macbooks,
+        gateway=FakeGateway(),
+    )
+
+    assert res.status == "no_fit"
+    assert res.order_id is None
+    assert "refused to buy" in res.reason
+    assert "every priced option found was above" in res.reason
+    assert "₹15,000.00" in res.reason
+    assert "₹79,990.00" in res.reason
+    assert "Nothing was ordered" in res.reason
+
+
+def test_exact_unavailable_product_gets_a_clear_non_budget_refusal():
+    accessories = [
+        SearchResult(
+            title="PlayStation 5 wireless controller",
+            url="https://example-shop.test/controller",
+            price_paise=6_000_00,
+            price_display="₹6,000",
+            seller="ExampleMart",
+            source="fixture",
+            snippet="Controller accessory",
+        )
+    ]
+    model = fixtures.ScriptedModel(
+        turns=[
+            [{"name": "web_search", "args": {"query": "Sony PlayStation 9 console"}, "id": "search"}],
+            [{"name": "finish", "args": {"summary": "No match."}, "id": "finish"}],
+        ]
+    )
+
+    res = agent.run(
+        "Buy one Sony PlayStation 9 console, exact model only, do not substitute",
+        500_000,
+        category="game console",
+        model=model,
+        search_fn=lambda query: accessories,
+        gateway=FakeGateway(),
+    )
+
+    assert res.status == "no_fit"
+    assert res.order_id is None
+    assert "none of the live results matched the exact requested product" in res.reason
+    assert "budget was not the issue" in res.reason
+    assert "substitutions were not allowed" in res.reason
+    assert "Nothing was ordered" in res.reason

@@ -3,6 +3,12 @@
 // stream that produced the chosen product is gone by the time the buyer
 // returns. We stash the product here before handing off, and read it back on
 // the return so the confirmation can still name and link to the item.
+//
+// Uses localStorage (not sessionStorage) deliberately: the hand-off leaves our
+// origin for Razorpay's hosted page and comes back via a top-level redirect;
+// sessionStorage can be dropped across that cross-origin round-trip in some
+// browsers, whereas localStorage survives it. The value is cleared on "Start
+// over", so it never lingers past the one confirmation it exists for.
 export const LAST_PURCHASE_KEY = "vera:lastPurchase";
 
 export interface StashedPurchase {
@@ -15,7 +21,7 @@ export interface StashedPurchase {
 
 export function stashPurchase(p: StashedPurchase): void {
   try {
-    sessionStorage.setItem(LAST_PURCHASE_KEY, JSON.stringify(p));
+    localStorage.setItem(LAST_PURCHASE_KEY, JSON.stringify(p));
   } catch {
     // Storage can be unavailable (private mode, blocked). The receipt degrades
     // gracefully; never let this break the payment hand-off.
@@ -24,7 +30,7 @@ export function stashPurchase(p: StashedPurchase): void {
 
 export function readStashedPurchase(): StashedPurchase | null {
   try {
-    const raw = sessionStorage.getItem(LAST_PURCHASE_KEY);
+    const raw = localStorage.getItem(LAST_PURCHASE_KEY);
     if (!raw) return null;
     const p = JSON.parse(raw) as StashedPurchase;
     return typeof p?.title === "string" ? p : null;
@@ -35,7 +41,7 @@ export function readStashedPurchase(): StashedPurchase | null {
 
 export function clearStashedPurchase(): void {
   try {
-    sessionStorage.removeItem(LAST_PURCHASE_KEY);
+    localStorage.removeItem(LAST_PURCHASE_KEY);
   } catch {
     // ignore
   }

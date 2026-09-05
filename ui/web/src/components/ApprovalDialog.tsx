@@ -100,7 +100,7 @@ export default function ApprovalDialog({
       >
         <p className="approval-dialog__eyebrow">Vera · payment agent</p>
         <h2 id={TITLE_ID} className="approval-dialog__title">
-          Approve this payment?
+          Here&rsquo;s what I found
         </h2>
         <ProductCard
           title={productTitle}
@@ -114,7 +114,7 @@ export default function ApprovalDialog({
         </p>
         <p className="approval-dialog__context">
           That&rsquo;s under your signed budget of <span className="mono">{rupees(budgetPaise)}</span>, and the merchant
-          re-verified the price. Approve to go to the Razorpay gateway.
+          re-verified the price. One click authorizes and takes you straight to the Razorpay gateway.
         </p>
         <p className="approval-dialog__note">Razorpay test-mode payment — no real money moves.</p>
         <div className="approval-dialog__actions">
@@ -122,7 +122,7 @@ export default function ApprovalDialog({
             Cancel
           </button>
           <button className="btn btn--primary" type="button" onClick={onApprove}>
-            Approve &amp; pay
+            Authorize &amp; pay
           </button>
         </div>
       </div>

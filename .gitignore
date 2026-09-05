@@ -18,3 +18,7 @@ secrets/
 # Local working instructions and build plan - not for the public repo
 CLAUDE.md
 plan.md
+
+# Local scratch / tool output
+scratch_vite.log
+.playwright-mcp/

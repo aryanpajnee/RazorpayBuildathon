@@ -204,10 +204,22 @@ def test_acquire_raises_instead_of_spinning_forever_when_sleep_does_not_advance_
         guard.acquire()  # window never frees up because the clock is frozen
 
 
-def test_default_rate_guard_is_wired_from_config():
+def test_default_rate_guard_is_wired_from_the_active_provider(monkeypatch):
+    # The guard tracks whichever provider is the front, against its own limits,
+    # so swapping LLM_PROVIDER doesn't leave it tuned for the wrong provider.
+    monkeypatch.setattr(config, "LLM_PROVIDER", "gemini")
     guard = default_rate_guard()
-    assert guard.rpm_limit == config.GEMINI_RPM_LIMIT
-    assert guard.daily_limit == config.GEMINI_DAILY_LIMIT
+    assert (guard.rpm_limit, guard.daily_limit) == (
+        config.GEMINI_RPM_LIMIT,
+        config.GEMINI_DAILY_LIMIT,
+    )
+
+    monkeypatch.setattr(config, "LLM_PROVIDER", "groq")
+    guard = default_rate_guard()
+    assert (guard.rpm_limit, guard.daily_limit) == (
+        config.GROQ_RPM_LIMIT,
+        config.GROQ_DAILY_LIMIT,
+    )
 
 
 # --- get_chat_model: provider validation ---------------------------------------------
@@ -552,3 +564,142 @@ def test_default_provider_non_transient_failure_still_propagates(monkeypatch):
 
     with pytest.raises(ValueError):
         gateway.invoke([], purpose="planner")
+
+
+# --- Emergency fallback lane (config.FALLBACK_LLM_*) -----------------------------------
+#
+# When the ACTIVE provider is rate-limited or out of daily quota, the gateway
+# fails over ONCE to a second key (a distinct Groq key by default) so a run
+# stays alive instead of dying on a 429. These tests drive the routed path
+# (no explicit model) with fakes, and stub `get_chat_model` so both the primary
+# and the fallback models are fakes — no key, no network.
+
+
+def _route_to_fakes(monkeypatch, *, primary, fallback, fallback_key="fb-key"):
+    """Point the gateway's routed path at two fake models: the default provider
+    (Gemini) gets `primary`, the Groq fallback gets `fallback`. Also switch the
+    fallback lane on with a stub key."""
+    models = {"gemini": primary, "nvidia": primary, "groq": fallback}
+    monkeypatch.setattr(
+        "buyer.llm.get_chat_model",
+        lambda *, provider, api_key=None, **_: models[provider],
+    )
+    monkeypatch.setattr(config, "LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(config, "FALLBACK_LLM_PROVIDER", "groq")
+    monkeypatch.setattr(config, "GROQ_API_KEY_FALLBACK", fallback_key)
+
+
+def test_invoke_fails_over_to_the_fallback_when_the_daily_budget_is_spent(monkeypatch):
+    """The archetypal case: Gemini's daily quota is gone, so the primary guard
+    raises before the model is even called; the call is served by the fallback
+    lane on its own budget instead of dying."""
+    primary = FakeModel(["served-by-primary"])
+    fallback = FakeModel(["served-by-fallback"])
+    _route_to_fakes(monkeypatch, primary=primary, fallback=fallback)
+
+    primary_guard, _ = make_guard(rpm_limit=1000, daily_limit=1)  # room for exactly one call
+    fb_guard, _ = make_guard(rpm_limit=1000, daily_limit=1000)
+    gateway = LLMGateway(guard=primary_guard, fallback_guard=fb_guard, max_attempts=2)
+
+    assert gateway.invoke([], purpose="negotiator") == "served-by-primary"
+    # primary daily budget now spent -> this one must be served by the fallback
+    assert gateway.invoke([], purpose="negotiator") == "served-by-fallback"
+    assert primary.calls == 1
+    assert fallback.calls == 1
+
+
+def test_invoke_fails_over_when_transient_retries_are_exhausted(monkeypatch):
+    """A sustained 429 on the primary (retries all spent) also trips the lane."""
+    primary = FakeModel([TransientLLMError("429")] * 5)
+    fallback = FakeModel(["recovered-on-fallback"])
+    _route_to_fakes(monkeypatch, primary=primary, fallback=fallback)
+
+    clock = FakeClock()
+    primary_guard, _ = make_guard(rpm_limit=1000, daily_limit=1000, clock=clock)
+    fb_guard, _ = make_guard(rpm_limit=1000, daily_limit=1000, clock=clock)
+    gateway = LLMGateway(
+        guard=primary_guard, fallback_guard=fb_guard, max_attempts=3, sleep_fn=clock.sleep
+    )
+
+    assert gateway.invoke([], purpose="negotiator") == "recovered-on-fallback"
+    assert primary.calls == 3  # the full retry budget was burned first
+    assert fallback.calls == 1
+
+
+def test_a_non_transient_error_does_not_trigger_the_fallback(monkeypatch):
+    """A bug or auth failure must surface, not be papered over by the fallback."""
+    primary = FakeModel([ValueError("malformed prompt")])
+    fallback = FakeModel(["should-never-run"])
+    _route_to_fakes(monkeypatch, primary=primary, fallback=fallback)
+
+    primary_guard, _ = make_guard()
+    fb_guard, _ = make_guard()
+    gateway = LLMGateway(guard=primary_guard, fallback_guard=fb_guard)
+
+    with pytest.raises(ValueError):
+        gateway.invoke([], purpose="negotiator")
+    assert fallback.calls == 0
+
+
+def test_no_fallback_key_leaves_the_original_exhaustion_error_intact(monkeypatch):
+    """With the lane unconfigured, behaviour is exactly as before it existed."""
+    primary = FakeModel([TransientLLMError("429")] * 5)
+    fallback = FakeModel(["unused"])
+    _route_to_fakes(monkeypatch, primary=primary, fallback=fallback, fallback_key="")
+
+    clock = FakeClock()
+    primary_guard, _ = make_guard(clock=clock)
+    gateway = LLMGateway(guard=primary_guard, max_attempts=2, sleep_fn=clock.sleep)
+
+    with pytest.raises(RetryBudgetExceededError):
+        gateway.invoke([], purpose="negotiator")
+    assert fallback.calls == 0
+
+
+def test_the_fallback_lane_only_fires_once(monkeypatch):
+    """If the fallback lane is itself exhausted, its error propagates — the
+    gateway never ping-pongs back to the (already spent) primary."""
+    primary = FakeModel([TransientLLMError("429")] * 5)
+    fallback = FakeModel([TransientLLMError("429")] * 5)
+    _route_to_fakes(monkeypatch, primary=primary, fallback=fallback)
+
+    clock = FakeClock()
+    primary_guard, _ = make_guard(rpm_limit=1000, daily_limit=1000, clock=clock)
+    fb_guard, _ = make_guard(rpm_limit=1000, daily_limit=1000, clock=clock)
+    gateway = LLMGateway(
+        guard=primary_guard, fallback_guard=fb_guard, max_attempts=2, sleep_fn=clock.sleep
+    )
+
+    with pytest.raises(RetryBudgetExceededError):
+        gateway.invoke([], purpose="negotiator")
+    assert primary.calls == 2 and fallback.calls == 2
+
+
+def test_an_injected_explicit_model_never_uses_the_fallback_lane(monkeypatch):
+    """A single injected model has no routing and no second key to swap in, so
+    exhaustion propagates as it always did (existing callers/tests rely on it)."""
+    monkeypatch.setattr(config, "FALLBACK_LLM_PROVIDER", "groq")
+    monkeypatch.setattr(config, "GROQ_API_KEY_FALLBACK", "fb-key")  # lane armed, but...
+    gateway, model, clock = make_gateway([TransientLLMError("429")] * 5, max_attempts=2)
+
+    with pytest.raises(RetryBudgetExceededError):
+        gateway.invoke([], purpose="negotiator")
+    assert model.calls == 2
+
+
+def test_get_chat_model_threads_an_explicit_api_key_override(monkeypatch):
+    """The mechanism the fallback lane rides on: an explicit `api_key` override
+    wins over the configured key, so a second Groq key builds its own client."""
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr(config, "GROQ_API_KEY", "primary-groq-key")
+
+    get_chat_model(provider="groq", api_key="fallback-groq-key")
+
+    assert captured["api_key"] == "fallback-groq-key"
+    assert captured["base_url"] == config.GROQ_BASE_URL

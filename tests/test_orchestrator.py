@@ -59,6 +59,23 @@ def test_offline_happy_path_yields_a_well_formed_event_sequence():
     assert seqs == sorted(seqs)
     assert len(set(seqs)) == len(seqs)  # strictly monotonic, no repeats
 
+
+def test_offline_happy_path_emits_product_chosen_with_the_real_candidate_url():
+    """The UI's clickable product link is driven by a `product_chosen` event
+    whose url comes from the real search candidate, not the model's echoed
+    tool args. The offline script lists CHEAP_SHOE, so the event must carry that
+    candidate's authoritative url + seller, ready for a real anchor."""
+    events = list(orchestrator.run_streamed("buy me running shoes", 9000, mode="offline"))
+
+    chosen = [e for e in events if e["type"] == "product_chosen"]
+    assert chosen, "expected a product_chosen event on the happy path"
+    last = chosen[-1]
+    assert last["url"].startswith("https://"), "link must be a real http(s) url"
+    assert last["url"] == "https://example-shop.test/products/streetflex-running-sneakers"
+    assert last["title"]
+    # Sourced from the candidate, so display fields the model never echoed are present.
+    assert last["seller"]
+
     for event in events:
         assert json.loads(json.dumps(event)) == event
 
