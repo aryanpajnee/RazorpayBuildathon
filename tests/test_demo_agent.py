@@ -105,3 +105,49 @@ def test_empty_category_stops_cleanly():
                     search_fn=fixtures.fake_search, gateway=FakeGateway())
     assert res.status == "no_category"
     assert res.order_id is None
+
+
+class _RaisingModel:
+    """A model whose .invoke raises — stands in for a live provider rejecting a
+    turn (e.g. groq's HTTP 400 `tool_use_failed` on a malformed tool call)."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def bind_tools(self, tools):  # noqa: ARG002 — shape-compatible with a real model
+        return self
+
+    def invoke(self, messages):  # noqa: ARG002 — always raises
+        raise self._exc
+
+
+def test_malformed_tool_call_ends_honestly_not_a_crash():
+    # The live crash reproduced: groq rejects a malformed `finish` tool call with
+    # a 400 `tool_use_failed`. run() must swallow it into an honest no-fit result
+    # — never let it escape as a traceback (which the UI shows as "something went
+    # wrong") — and must place NO order, since no tool ran.
+    gw = FakeGateway()
+    boom = RuntimeError(
+        "Error code: 400 - {'error': {'code': 'tool_use_failed', "
+        "'message': 'Failed to parse tool call arguments as JSON'}}"
+    )
+    res = agent.run("gaming laptop", 2000, category="electronics",
+                    model=_RaisingModel(boom), search_fn=fixtures.fake_search, gateway=gw)
+    assert res.status == "no_fit"
+    assert res.order_id is None
+    assert gw.calls == 0  # nothing was bought
+    assert "2,000" in res.reason  # the honest reason names the signed budget
+
+
+def test_generic_model_error_is_reported_not_over_claimed():
+    # A non-tool-call model failure (e.g. a network drop) must also end the run
+    # honestly, but must NOT be mislabelled "no fit" — it is named as a model
+    # failure so the outcome stays truthful.
+    gw = FakeGateway()
+    res = agent.run("running shoes", 9000, category="footwear",
+                    model=_RaisingModel(ConnectionError("connection reset")),
+                    search_fn=fixtures.fake_search, gateway=gw)
+    assert res.status == "stopped"
+    assert res.order_id is None
+    assert gw.calls == 0
+    assert "ConnectionError" in res.reason

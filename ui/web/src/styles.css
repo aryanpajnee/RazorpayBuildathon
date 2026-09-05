@@ -590,6 +590,12 @@ fieldset:disabled .mode-toggle__option {
   font-style: italic;
 }
 
+.verdict__reason {
+  color: var(--soft);
+  line-height: 1.5;
+  margin: 20px 0 0;
+}
+
 .product-card {
   background: var(--card);
   border: 1px solid var(--line);

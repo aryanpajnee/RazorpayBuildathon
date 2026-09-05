@@ -4,6 +4,7 @@
 import { rupees } from "../format";
 import { chosenProduct, latestGateResult, latestQuote } from "../reducer";
 import type { AppEvent, RunComplete, RunError } from "../types";
+import ProductCard from "./ProductCard";
 
 interface Props {
   events: AppEvent[];
@@ -23,13 +24,12 @@ export default function VerdictStep({ events, completion, onPay, onStartOver }: 
       <h1 className="verdict__title">The verdict</h1>
 
       {product ? (
-        <div className="product-card">
-          <p className="product-card__title">{product.title}</p>
-          <p className="product-card__meta">
-            {product.seller ? `${product.seller} · ` : ""}
-            {product.webPriceDisplay ? `seen at ${product.webPriceDisplay} on the web` : "found on the web"}
-          </p>
-        </div>
+        <ProductCard
+          title={product.title}
+          seller={product.seller}
+          priceDisplay={product.webPriceDisplay}
+          url={product.url}
+        />
       ) : (
         <p className="verdict__empty">Vera did not settle on a product.</p>
       )}
@@ -57,6 +57,12 @@ export default function VerdictStep({ events, completion, onPay, onStartOver }: 
           </span>
         </div>
       )}
+
+      {/* No Gate decision means the buyer never submitted a cart — it gave up
+          before signing anything (most often: nothing fit under the signed
+          budget). Show the honest reason so the outcome explains itself, rather
+          than leaving the reader with a bare "did not settle on a product". */}
+      {!gate && reason && <p className="verdict__reason">{reason}</p>}
 
       <div className="verdict__actions">
         {gate?.passed ? (

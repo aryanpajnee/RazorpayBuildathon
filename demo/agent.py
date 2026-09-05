@@ -151,6 +151,40 @@ def _gate_checks(passed: bool, reason_code: str | None) -> list[dict]:
     return checks
 
 
+def _emit_product_chosen(on_event: "Callable[..., None] | None", context, args: dict) -> None:
+    """Emit the display-only `product_chosen` fact: which item the buyer listed
+    with the merchant, for the UI's product link/receipt.
+
+    Prefers the matching REAL search candidate (`context.last_candidates`, the
+    structured web data the search tool captured) over the model's echoed tool
+    args -- matched by url first, then by exact title -- so the link points at
+    the authoritative listing even if the model truncated the url. Falls back to
+    the model's own args when nothing matches. This is presentation only; the
+    enforced total is the merchant's re-derived quote, never anything here.
+    """
+    if on_event is None:
+        return
+    arg_title = args.get("title") if isinstance(args.get("title"), str) else ""
+    arg_url = args.get("url") if isinstance(args.get("url"), str) else ""
+    arg_source = args.get("source") if isinstance(args.get("source"), str) else "external"
+
+    candidates = context.last_candidates or []
+    match = next((c for c in candidates if arg_url and c.get("url") == arg_url), None)
+    if match is None:
+        match = next((c for c in candidates if arg_title and c.get("title") == arg_title), None)
+    match = match or {}
+
+    _emit_event(
+        on_event,
+        "product_chosen",
+        title=match.get("title") or arg_title or "Unknown item",
+        url=match.get("url") or arg_url or "",
+        seller=match.get("seller"),
+        price_display=match.get("price_display"),
+        source=match.get("source") or arg_source,
+    )
+
+
 def _emit_ledger_append(on_event: "Callable[..., None] | None") -> None:
     """Read the REAL ledger back after a Gate decision writes to it -- never
     fabricate a row. If the ledger cannot be read in a given wiring, emit
@@ -213,6 +247,14 @@ def _emit_tool_side_effects(
                     total_display=_rupees_display(quote.total_paise),
                     budget_paise=context.budget_paise,
                 )
+            # Display-only: name the product the buyer just listed, so the UI can
+            # show a real, clickable link to the exact item chosen -- at approval,
+            # on the gateway hand-off, and on the receipt. Sourced from the REAL
+            # search candidate (authoritative web data the search tool captured),
+            # preferring it over the model's echoed tool args, which an LLM can
+            # truncate or mangle. NEVER read back into a money decision: the
+            # merchant's re-derived quote above is the only enforced number.
+            _emit_product_chosen(on_event, context, args)
         return
 
     if name == "sign_and_submit":
@@ -326,6 +368,7 @@ def run(
     llm_calls = 0
     turns = 0          # model turns ACTUALLY executed — not the loop counter, which
     hit_llm_budget = False  # would overcount by one on the iteration that detects the break
+    model_error: Exception | None = None  # a model turn that raised, ending the run honestly
 
     for _ in range(step_cap):
         if context.finished or context.order is not None:
@@ -334,7 +377,32 @@ def run(
             hit_llm_budget = True
             break
 
-        ai = model_with_tools.invoke(messages)
+        try:
+            ai = model_with_tools.invoke(messages)
+        except Exception as exc:  # noqa: BLE001 — a model misfire ENDS the run, never crashes it
+            # The model produced an unusable turn. The common live case is a
+            # smaller tool-calling model emitting MALFORMED tool-call JSON when
+            # it gives up — e.g. groq's `tool_use_failed` on a `finish` call:
+            #   '{"name": "finish", "arguments": Summary: no fit under budget."}'
+            # (invalid JSON) — which the provider rejects with an HTTP 400. This
+            # invoke deliberately bypasses the LLMGateway retry/guard (bind_tools
+            # integration is later work), so nothing upstream catches it, and an
+            # uncaught raise here would surface to the user as a bare "something
+            # went wrong" instead of the truthful "nothing was bought" outcome.
+            #
+            # SAFE BY CONSTRUCTION: a failed model call ran NO tool, so no quote
+            # was issued, nothing was signed, the Gate made no decision, and no
+            # order exists. Ending the run here can only ever UNDER-buy; it can
+            # never fabricate a purchase. We record it and fall through to the
+            # honest status derivation below.
+            model_error = exc
+            llm_calls += 1
+            turns += 1
+            _event(transcript, "thought",
+                   text="Vera could not finalise a valid next action, so it stopped "
+                        "without ordering — nothing was bought.",
+                   on_event=on_event)
+            break
         llm_calls += 1
         turns += 1
         messages.append(ai)
@@ -386,6 +454,24 @@ def run(
             status="no_fit",
             reason=context.summary or "The agent finished without placing an order.",
         )
+    elif model_error is not None:
+        # The run ended because a model turn raised (see the loop's try/except).
+        # Report it honestly and specifically -- never as a fake success and
+        # never as a bare crash. A malformed tool call (the model fumbling its
+        # own "give up" turn) reads as a clean no-fit; any other model error is
+        # named as such so "no fit" is not over-claimed.
+        if _is_malformed_tool_call(model_error):
+            result = RunResult(
+                status="no_fit",
+                reason=f"Vera stopped without ordering — it could not settle on a "
+                       f"purchase within the signed ₹{budget_paise // 100:,} budget.",
+            )
+        else:
+            result = RunResult(
+                status="stopped",
+                reason=f"The buyer model failed mid-run "
+                       f"({type(model_error).__name__}); nothing was ordered.",
+            )
     elif hit_llm_budget:
         result = RunResult(status="llm_budget_exhausted",
                            reason=f"Stopped: hit the per-run model-call budget ({config.AGENT_MAX_LLM_CALLS}).")
@@ -393,12 +479,40 @@ def run(
         result = RunResult(status="step_cap",
                            reason=f"Stopped: hit the step cap ({step_cap}) without an order.")
     else:
-        result = RunResult(status="stopped", reason="Run ended without an order.")
+        # The model ended with a plain message instead of a `finish` tool call
+        # (no order, no cap hit). In a shopping run that is a no-buy outcome; give
+        # it a budget-aware reason so the Verdict explains itself even when the
+        # model did not phrase its own summary.
+        result = RunResult(
+            status="stopped",
+            reason=f"Vera ended the run without a purchase within the signed "
+                   f"₹{budget_paise // 100:,} budget.",
+        )
 
     result.steps = turns
     result.llm_calls = llm_calls
     result.transcript = transcript
     return result
+
+
+_MALFORMED_TOOL_CALL_MARKERS = (
+    "tool_use_failed",
+    "failed to parse tool call",
+    "invalid tool call",
+    "could not parse tool",
+)
+
+
+def _is_malformed_tool_call(exc: BaseException) -> bool:
+    """True when a model turn failed because the model emitted an UNUSABLE tool
+    call (bad/no JSON in the arguments), as opposed to a transient network or
+    auth error. Recognised heuristically by provider phrasing -- the same
+    approach `buyer/llm.py:_is_transient` uses -- so this file never has to
+    import each provider SDK's private exception types. A false negative is
+    harmless: the run still ends honestly, just under the generic model-error
+    reason instead of the tidier no-fit one."""
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(marker in text for marker in _MALFORMED_TOOL_CALL_MARKERS)
 
 
 def _message_text(ai) -> str:
