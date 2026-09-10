@@ -164,12 +164,10 @@ def test_recovery_script_contains_an_over_limit_then_recovery_flow() -> None:
 
 
 def test_happy_path_uses_the_named_cheap_shoe_fixture() -> None:
-    """The scripts reuse the same named fixture rows fake_search returns, so
-    the two never drift out of sync."""
+    """The script selects a server-issued row instead of echoing product fields."""
     model = happy_path_script()
     model.bind_tools([])
     model.invoke([])  # web_search
     listing = model.invoke([])
     args = listing.tool_calls[0]["args"]
-    assert args["title"] == CHEAP_SHOE.title
-    assert args["price_paise"] == CHEAP_SHOE.price_paise
+    assert args == {"candidate_id": "$candidate_1"}

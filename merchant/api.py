@@ -43,7 +43,7 @@ from pydantic import BaseModel, StrictInt
 
 import config
 from core.ledger import all_entries, append
-from merchant import catalog, gateway, offers, webhooks
+from merchant import catalog, gateway, intent_store, offers, webhooks
 from merchant.agents import refusal_explainer, sales, storefront, substitution
 from merchant.agents import catalog as catalog_agent
 from merchant.agents import negotiator as merchant_negotiator
@@ -326,12 +326,23 @@ def post_checkout(body: CheckoutRequest) -> dict:
             result.total_paise,
             notes={"quote_id": result.quote_id, "cart_mandate_id": result.cart_mandate_id},
         )
+    except gateway.AmountMismatchError as exc:
+        # The mismatch is detected from a local idempotency row before any
+        # gateway call, so this cart made no order and can release authority.
+        intent_store.release_authority(result.cart_mandate_id)
+        response["order_error"] = str(exc)
+        return response
     except gateway.GatewayError as exc:
         # The gate approved, but order creation failed (a decline, a network
         # error, an unconfirmed amount). Still HTTP 200 — the caller branches
         # on the body, same contract as a refusal — with the failure surfaced.
         response["order_error"] = str(exc)
         return response
+
+    if order.from_cache:
+        intent_store.release_authority(result.cart_mandate_id)
+    else:
+        intent_store.commit_authority(result.cart_mandate_id)
 
     # Order-first, then payment.attempted — and only when the order was
     # genuinely just created (not an idempotent cache hit for a re-quoted same

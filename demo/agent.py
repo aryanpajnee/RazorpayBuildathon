@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import config
-from demo.tools import build_tools, grant_intent
+from demo.tools import ToolContext, build_tools, grant_intent
 from merchant import offers
 
 SYSTEM_PROMPT = """You are an autonomous shopping agent buying ONE item for a user.
@@ -167,24 +167,23 @@ def _emit_product_chosen(on_event: "Callable[..., None] | None", context, args: 
     """
     if on_event is None:
         return
-    arg_title = args.get("title") if isinstance(args.get("title"), str) else ""
-    arg_url = args.get("url") if isinstance(args.get("url"), str) else ""
-    arg_source = args.get("source") if isinstance(args.get("source"), str) else "external"
+    candidate_id = args.get("candidate_id") if isinstance(args.get("candidate_id"), str) else ""
 
     candidates = context.last_candidates or []
-    match = next((c for c in candidates if arg_url and c.get("url") == arg_url), None)
-    if match is None:
-        match = next((c for c in candidates if arg_title and c.get("title") == arg_title), None)
+    match = next(
+        (c for c in candidates if candidate_id and c.get("candidate_id") == candidate_id),
+        None,
+    )
     match = match or {}
 
     _emit_event(
         on_event,
         "product_chosen",
-        title=match.get("title") or arg_title or "Unknown item",
-        url=match.get("url") or arg_url or "",
+        title=match.get("title") or "Unknown item",
+        url=match.get("url") or "",
         seller=match.get("seller"),
         price_display=match.get("price_display"),
-        source=match.get("source") or arg_source,
+        source=match.get("source") or "unknown",
     )
 
 
@@ -283,6 +282,7 @@ def run(
     model=None,
     search_fn=None,
     gateway=None,
+    context: ToolContext | None = None,
     max_steps: int | None = None,
     on_event: "Callable[..., None] | None" = None,
 ) -> RunResult:
@@ -303,13 +303,6 @@ def run(
     budget_paise = budget_rupees * 100
     transcript: list[dict] = []
 
-    # This run owns the external offers it registers. Clearing at the start bounds
-    # the shared in-process catalog so offers from an earlier run cannot pile up or
-    # linger as buyable products — important once a long-lived caller (the Day-3
-    # UI) drives many runs. Assumes one run per process at a time (true for the
-    # proof script and a single-user UI); clear_offers is process-global.
-    offers.clear_offers()
-
     # 1. The product scope. Open vocabulary: understood from the free-text request
     #    by the Intent Compiler LLM (or injected for a deterministic offline run).
     #    This label is what the user signs for; the Gate enforces it, the LLM never
@@ -328,13 +321,21 @@ def run(
     _emit_event(on_event, "intent_understood", category=category)
 
     # 2. The one consent step: mint the agent key, register the signed intent.
-    context = grant_intent(
-        request=request,
-        budget_paise=budget_paise,
-        category=category,
-        search_fn=search_fn,
-        gateway=gateway,
-    )
+    if context is None:
+        context = grant_intent(
+            request=request,
+            budget_paise=budget_paise,
+            category=category,
+            search_fn=search_fn,
+            gateway=gateway,
+        )
+    else:
+        if context.budget_paise != budget_paise or context.category != category:
+            raise ValueError("prepared context does not match this run's budget and category")
+        if search_fn is not None:
+            context.search_fn = search_fn
+        if gateway is not None:
+            context.gateway = gateway
     _event(transcript, "intent_granted", agent_id=context.agent_id, category=category,
            budget_paise=budget_paise, intent_mandate_id=context.intent_mandate_id,
            on_event=on_event)
@@ -442,6 +443,10 @@ def run(
             _event(transcript, "tool_result", name=name, result=out, on_event=on_event)
             _emit_tool_side_effects(on_event, context, name, args, quote_id_before, gate_result_before)
             messages.append(ToolMessage(content=out, tool_call_id=call_id))
+            if context.finished or context.order is not None:
+                # Do not execute later calls from the same model batch after a
+                # purchase or an ambiguous gateway outcome ends the run.
+                break
 
     # Search prices are advisory rather than authoritative, but when every priced
     # result is already above the signed ceiling we can state that no-buy reason

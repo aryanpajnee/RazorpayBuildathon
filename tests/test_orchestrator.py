@@ -9,6 +9,8 @@ makes zero external API calls, same as the module it tests.
 from __future__ import annotations
 
 import json
+import fcntl
+import multiprocessing
 import pathlib
 import tempfile
 import time
@@ -16,6 +18,7 @@ import time
 import config
 
 _tmp = pathlib.Path(tempfile.mkdtemp(prefix="test_orchestrator_"))
+config.RUN_LOCK_PATH = _tmp / "agent-run.lock"
 config.LEDGER_DB = _tmp / "ledger.db"
 config.QUOTES_DB = _tmp / "quotes.db"
 config.GATE_NONCES_DB = _tmp / "gate_nonces.db"
@@ -29,6 +32,13 @@ from demo import orchestrator  # noqa: E402
 from merchant import offers  # noqa: E402
 
 _TERMINAL_TYPES = {"run_complete", "run_error"}
+
+
+def _hold_file_lock(path: str, connection) -> None:
+    with open(path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        connection.send("locked")
+        connection.recv()
 
 
 @pytest.fixture(autouse=True)
@@ -119,11 +129,10 @@ def test_single_run_lock_rejects_a_concurrent_call():
     # A second call while gen1's run is still in flight must be refused
     # outright, with a single run_error and nothing else.
     gen2 = orchestrator.run_streamed("buy me running shoes", 9000, mode="offline")
-    rejected = next(gen2)
-    assert rejected["type"] == "run_error"
-    assert "already in progress" in rejected["error"]
-    with pytest.raises(StopIteration):
-        next(gen2)
+    rejected = list(gen2)
+    assert [event["type"] for event in rejected] == ["run_started", "run_error"]
+    assert "already in progress" in rejected[-1]["error"]
+    assert len({event["run_id"] for event in rejected}) == 1
 
     # Draining gen1 to completion releases the lock and lets its worker
     # thread finish cleanly — a subsequent run must then succeed normally.
@@ -132,6 +141,29 @@ def test_single_run_lock_rejects_a_concurrent_call():
 
     events = list(orchestrator.run_streamed("buy me running shoes", 9000, mode="offline"))
     assert events[-1]["type"] == "run_complete"
+
+
+def test_file_lock_rejects_a_run_held_by_another_process(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "RUN_LOCK_PATH", tmp_path / "agent-run.lock")
+    parent, child = multiprocessing.Pipe()
+    process = multiprocessing.Process(
+        target=_hold_file_lock,
+        args=(str(tmp_path / "agent-run.lock"), child),
+    )
+    process.start()
+    try:
+        assert parent.recv() == "locked"
+        events = list(
+            orchestrator.run_streamed("buy me running shoes", 9000, mode="offline")
+        )
+        assert [event["type"] for event in events] == ["run_started", "run_error"]
+        assert "already in progress" in events[-1]["error"]
+    finally:
+        parent.send("release")
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join()
 
 
 def test_abandoned_consumer_does_not_wedge_the_lock():

@@ -24,7 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import config
-from merchant import gateway, webhooks
+from merchant import gateway, intent_store, webhooks
 from merchant.api import app
 
 from tests.test_api import _grant_intent_and_sign_cart, _issue_quote
@@ -39,6 +39,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "GATE_NONCES_DB", tmp_path / "gate_nonces.db")
     monkeypatch.setattr(config, "LEDGER_DB", tmp_path / "ledger.db")
     monkeypatch.setattr(config, "USE_FAKE_GATEWAY", True)
+    monkeypatch.setattr(config, "RAZORPAY_KEY_ID", "rzp_test_unit_only")
     monkeypatch.setattr(config, "RAZORPAY_WEBHOOK_SECRET", WEBHOOK_SECRET)
     # gateway.py and webhooks.py bind these at import time, so config.* alone
     # does not reach them -- patch the module-level attributes directly.
@@ -130,6 +131,7 @@ def test_checkout_pass_creates_order_and_logs_in_order(client):
     assert "order_id" in body
     order_id = body["order_id"]
     assert body["pay_url"] == f"/pay/{order_id}"
+    assert intent_store.reservation_status(body["cart_mandate_id"]) == "committed"
 
     entries = _ledger_entries(client)
     by_type = {}
@@ -199,7 +201,7 @@ def test_checkout_idempotent_on_quote_id(client):
     # what the helper mints each call). quote_id idempotency is meant to
     # handle exactly this: two distinct, independently-valid carts converging
     # on the same quote_id must still resolve to one order.
-    envelope2, _intent2 = _grant_intent_and_sign_cart(
+    envelope2, intent2 = _grant_intent_and_sign_cart(
         client, max_paise=10_000_00, quote_data=quote_data
     )
 
@@ -208,10 +210,49 @@ def test_checkout_idempotent_on_quote_id(client):
     body2 = resp2.json()
     assert body2["passed"] is True
     assert body2["order_id"] == order_id_1
+    assert intent_store.reservation_status(body2["cart_mandate_id"]) == "released"
+    assert intent_store.authority_usage(intent2["mandate_id"]) == (0, 0)
 
     entries = _ledger_entries(client)
     order_created_entries = [e for e in entries if e["event_type"] == "order.created"]
     assert len(order_created_entries) == 1
+
+
+def test_checkout_keeps_authority_reserved_on_ambiguous_gateway_error(client, monkeypatch):
+    quote_data = _issue_quote(client)
+    envelope, intent = _grant_intent_and_sign_cart(
+        client, max_paise=10_000_00, quote_data=quote_data
+    )
+
+    def fail(*args, **kwargs):
+        raise gateway.OrderCreationError("gateway outcome unknown")
+
+    monkeypatch.setattr(gateway, "create_order", fail)
+    body = client.post("/checkout", json={"cart_envelope": envelope}).json()
+
+    assert body["passed"] is True
+    assert "order_error" in body
+    assert intent_store.reservation_status(body["cart_mandate_id"]) == "reserved"
+    assert intent_store.authority_usage(intent["mandate_id"]) == (1, quote_data["total_paise"])
+
+
+def test_checkout_releases_authority_when_idempotency_rejects_before_gateway(client):
+    quote_data = _issue_quote(client)
+    gateway.create_order(
+        quote_data["quote_id"],
+        quote_data["total_paise"] + 1,
+        gateway=gateway.FakeGateway(),
+    )
+    envelope, intent = _grant_intent_and_sign_cart(
+        client, max_paise=10_000_00, quote_data=quote_data
+    )
+
+    body = client.post("/checkout", json={"cart_envelope": envelope}).json()
+
+    assert body["passed"] is True
+    assert "already recorded" in body["order_error"]
+    assert intent_store.reservation_status(body["cart_mandate_id"]) == "released"
+    assert intent_store.authority_usage(intent["mandate_id"]) == (0, 0)
 
 
 # --- pay page -----------------------------------------------------------------

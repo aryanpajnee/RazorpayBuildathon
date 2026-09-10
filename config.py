@@ -24,6 +24,7 @@ WEBHOOK_EVENTS_DB = DATA_DIR / "webhook_events.db"  # delivered webhook hashes, 
 GATE_NONCES_DB = DATA_DIR / "gate_nonces.db"    # spent cart-mandate nonces, replay defence
 QUOTES_DB = DATA_DIR / "quotes.db"              # issued quotes, looked up by quote_id at gate time
 INTENTS_DB = DATA_DIR / "intents.db"            # granted+verified intents and their purchase counts
+RUN_LOCK_PATH = DATA_DIR / "agent-run.lock"      # cross-process serialization for UI buyer runs
 
 # --- LLM -------------------------------------------------------------------
 # The buyer agent needs reliable tool-calling. A local 8B model emits malformed
@@ -337,6 +338,8 @@ OFFER_MARGIN_BPS = 0   # merchant margin over the sourced price, in basis points
                         # 0 = relist at the sourced price. The merchant still
                         # owns this number — it is never the web's price verbatim.
 OFFER_SOURCE_TAG = "external_offer"
+OFFERS_DB = DATA_DIR / "offers.db"
+CANDIDATES_DB = DATA_DIR / "candidates.db"
 
 # Deterministic (no-LLM) keyword routing from a free-text web-find title into
 # one of CATALOG_CATEGORIES, so the Gate's exact-string category check still

@@ -19,6 +19,8 @@ config.GATE_NONCES_DB = _tmp / "gate_nonces.db"
 config.INTENTS_DB = _tmp / "intents.db"
 config.ORDERS_DB = _tmp / "orders.db"
 config.WEBHOOK_EVENTS_DB = _tmp / "webhook_events.db"
+config.CANDIDATES_DB = _tmp / "candidates.db"
+config.OFFERS_DB = _tmp / "offers.db"
 
 import pytest  # noqa: E402
 
@@ -51,6 +53,34 @@ def test_happy_path_places_one_order():
     # steps counts model turns actually executed (search, list, submit = 3), not
     # the extra loop iteration that detects the order and breaks.
     assert res.steps == 3 and res.llm_calls == 3
+
+
+def test_purchase_stops_later_tool_calls_from_the_same_model_batch():
+    gw = FakeGateway()
+    model = fixtures.ScriptedModel(
+        turns=[
+            [{"name": "web_search", "args": {"query": "running shoes"}, "id": "search"}],
+            [
+                {
+                    "name": "list_with_merchant",
+                    "args": {"candidate_id": "$candidate_1"},
+                    "id": "list",
+                },
+                {"name": "sign_and_submit", "args": {}, "id": "first-buy"},
+                {"name": "sign_and_submit", "args": {}, "id": "second-buy"},
+            ],
+        ]
+    )
+
+    res = agent.run(
+        "running shoes", 9000, category="footwear", model=model,
+        search_fn=fixtures.fake_search, gateway=gw,
+    )
+
+    assert res.status == "ordered"
+    assert gw.calls == 1
+    calls = [e["name"] for e in res.transcript if e["kind"] == "tool_call"]
+    assert calls == ["web_search", "list_with_merchant", "sign_and_submit"]
 
 
 def test_missing_model_returns_honest_status_not_a_traceback(monkeypatch):

@@ -47,7 +47,8 @@ from langchain_core.tools import StructuredTool
 import config
 from core.mandate import generate_keypair, make_cart_mandate, make_intent_mandate, sign
 from demo.search import SearchResult, parse_price_to_paise, web_search
-from merchant import gateway, intent_store, offers, quote_store
+from merchant import candidate_store, gateway, intent_store, offers, quote_store
+from merchant import catalog
 from merchant.catalog import resolve_lines
 from merchant.gate import check as gate_check
 from merchant.quote import create_quote
@@ -98,6 +99,7 @@ class ToolContext:
     finished: bool = False
     summary: str | None = None
     order: object = None             # merchant.gateway.Order once a Gate PASS creates one
+    uncertain_order: bool = False    # Gate passed but gateway outcome needs reconciliation
 
     # --- Day-3: display/telemetry ONLY, for demo/agent.py's live event feed ---
     # Neither field is ever read back into a money decision -- they exist so the
@@ -154,7 +156,7 @@ def grant_intent(
         agent_pubkey=vk.encode().hex(),
         category=category,
         max_paise=budget_paise,
-        max_purchases=5,
+        max_purchases=1,
         ttl_seconds=3600,
     )
     intent_store.register_intent(intent_payload)
@@ -208,7 +210,7 @@ def _url_is_fetchable(url: str) -> bool:
     return True
 
 
-def _format_candidates(results: list[SearchResult]) -> str:
+def _format_candidates(results: list[candidate_store.Candidate]) -> str:
     if not results:
         return "No candidates found for that query. Try different or broader search terms."
     lines = []
@@ -217,8 +219,9 @@ def _format_candidates(results: list[SearchResult]) -> str:
         seller = f" — {r.seller}" if r.seller else ""
         lines.append(
             f"{i}. {r.title}{seller}\n"
+            f"   candidate_id: {r.candidate_id}\n"
             f"   price: {price}  (price_paise={r.price_paise})\n"
-            f"   url: {r.url}  [source: {r.source}]"
+            f"   url: {r.url}  [source: {r.source}; {r.price_label}]"
         )
     return "Candidates found (prices are the web's, NOT the final charge):\n" + "\n".join(lines)
 
@@ -270,20 +273,29 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
         except Exception as exc:  # noqa: BLE001 — a search failure must not kill the run
             context.last_candidates = []  # never leave a stale prior result set behind
             return f"Search failed ({type(exc).__name__}). Try a different query."
-        # Stashed for demo/agent.py's `search_results` event — structured, so the
-        # UI never has to re-parse `_format_candidates`'s display string.
-        context.last_candidates = [
-            {
-                "title": r.title,
-                "seller": r.seller,
-                "price_display": r.price_display,
-                "price_paise": r.price_paise,
-                "url": r.url,
-                "source": r.source,
-            }
+        authority = (
+            "trusted_demo"
+            if getattr(context.search_fn, "__vera_candidate_authority__", None) == "trusted_demo"
+            else "advisory"
+        )
+        captured = [
+            candidate_store.capture(
+                intent_mandate_id=context.intent_mandate_id,
+                query=query,
+                title=r.title,
+                url=r.url,
+                seller=r.seller,
+                price_paise=r.price_paise,
+                price_display=r.price_display,
+                source=r.source or "unknown_search_provider",
+                snippet=r.snippet,
+                authority=authority,
+                scope_category=context.category,
+            )
             for r in results
         ]
-        return _format_candidates(results)
+        context.last_candidates = [candidate.as_display_dict() for candidate in captured]
+        return _format_candidates(captured)
 
     def open_product_tool(url: str) -> str:
         """Open ONE product page to read its price and a snippet, when a search
@@ -316,27 +328,35 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
             return f"Opened {url} but found no clear price on the page. Pick a candidate that lists one."
         return f"{url}\n  price: {display}  (price_paise={paise})"
 
-    def list_with_merchant_tool(title: str, url: str, price_paise: int, source: str = "external") -> str:
-        """List a chosen web find with the merchant (Northwind), which relists it
-        as a real product at its OWN price and issues a quote. Returns the quote
-        id and the merchant's total (incl. GST + shipping) — that total, not the
-        web price, is what the Gate will enforce. Call this before sign_and_submit."""
-        # price_paise is untrusted model input: reject a float/bool here the same
-        # way the frozen offer layer does, so the money discipline is visible at
-        # the tool boundary too (offers.create_offer re-checks regardless).
-        if type(price_paise) is not int:
-            return (
-                f"price_paise must be an integer number of paise, got "
-                f"{type(price_paise).__name__}. Re-read the candidate's price_paise value."
-            )
-        # The offer is relisted under the run's SIGNED scope (context.category),
-        # so the Gate's exact-string category check matches. No keyword table, no
-        # fixed vocabulary — the user asked for this product type and signed for
-        # it, so a find picked to fulfil that request is listed under it.
-        category = context.category
+    def list_with_merchant_tool(
+        candidate_id: str,
+        title: str | None = None,
+        url: str | None = None,
+        price_paise: int | None = None,
+        source: str | None = None,
+    ) -> str:
+        """Select a server-issued candidate id for a simulation quote.
+
+        Product fields are loaded from the captured record. Optional echoed
+        fields are accepted only to return a clear refusal when a model tries
+        to alter them; they never become offer inputs.
+        """
         try:
-            offer = offers.create_offer(
-                title=title, url=url, price_paise=price_paise, category=category, source=source
+            candidate = candidate_store.get(candidate_id)
+            if candidate is None:
+                raise offers.OfferError(
+                    "unknown candidate_id; search first and select a server-issued candidate"
+                )
+            supplied = {"title": title, "url": url, "price_paise": price_paise, "source": source}
+            for field_name, value in supplied.items():
+                if value is not None and value != getattr(candidate, field_name):
+                    raise offers.OfferError(
+                        f"altered {field_name} rejected; candidate fields are server-controlled"
+                    )
+            offer = offers.create_offer_from_candidate(
+                candidate_id=candidate_id,
+                intent_mandate_id=context.intent_mandate_id,
+                intent_category=context.category,
             )
             lines = resolve_lines([{"sku": offer.sku, "qty": 1}])
             quote = create_quote(lines)
@@ -360,6 +380,14 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
         Gate, which enforces your signed budget and every signature itself. With
         no quote_id, submits the most recently listed quote. Returns PASS with an
         order id, or REFUSED with the reason (which you can recover from)."""
+        if context.order is not None:
+            return (
+                f"Run already committed to order {context.order.order_id}; "
+                "no further purchase tools may run."
+            )
+        if context.finished:
+            return "Run already finished; no further purchase tools may run."
+
         qid = quote_id or context.last_quote_id
         if not qid or qid not in context.quotes:
             return "No quote to submit — call list_with_merchant first to get a quote_id."
@@ -372,6 +400,15 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
         context.submit_attempts += 1
 
         quote = context.quotes[qid]
+        simulated = isinstance(context.gateway, gateway.FakeGateway) or (
+            context.gateway is None and config.USE_FAKE_GATEWAY
+        )
+        product = catalog.get_product(quote.lines[0].sku)
+        if product.get("source") == "trusted_demo_fixture" and not simulated:
+            return (
+                "Checkout blocked: trusted demo fixture prices are simulation-only "
+                "and cannot be sent to a real payment gateway."
+            )
         cart_payload = make_cart_mandate(
             intent_mandate_id=context.intent_mandate_id,
             agent_id=context.agent_id,
@@ -403,9 +440,28 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
                 notes={"agent_id": context.agent_id, "quote_id": quote.quote_id},
                 gateway=context.gateway,
             )
-        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
-            return f"GATE PASSED but order creation failed ({type(exc).__name__}: {exc})."
+        except gateway.AmountMismatchError as exc:
+            # Detected locally before any external call, so no order was made.
+            intent_store.release_authority(result.cart_mandate_id)
+            return f"GATE PASSED but order creation was refused ({type(exc).__name__}: {exc})."
+        except Exception as exc:  # noqa: BLE001 — outcome may be ambiguous; never auto-retry
+            context.finished = True
+            context.uncertain_order = True
+            context.summary = (
+                "The Gate reserved this purchase, but the gateway outcome is uncertain. "
+                "The authority remains reserved for reconciliation; nothing else was submitted."
+            )
+            return (
+                f"GATE PASSED but order creation failed ({type(exc).__name__}: {exc}). "
+                "The outcome may be uncertain, so authority remains reserved and this run "
+                "must not retry automatically."
+            )
 
+        if order.from_cache:
+            # Returning an existing idempotent order did not make a new purchase.
+            intent_store.release_authority(result.cart_mandate_id)
+        else:
+            intent_store.commit_authority(result.cart_mandate_id)
         context.order = order
         return (
             f"GATE PASS — order {order.order_id} created for {_rupees(order.amount_paise)}. "
