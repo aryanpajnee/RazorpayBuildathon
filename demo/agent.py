@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import config
-from demo.tools import build_tools, grant_intent
+from demo.tools import ToolContext, build_tools, grant_intent
 from merchant import offers
 
 SYSTEM_PROMPT = """You are an autonomous shopping agent buying ONE item for a user.
@@ -283,6 +283,7 @@ def run(
     model=None,
     search_fn=None,
     gateway=None,
+    context: ToolContext | None = None,
     max_steps: int | None = None,
     on_event: "Callable[..., None] | None" = None,
 ) -> RunResult:
@@ -303,13 +304,6 @@ def run(
     budget_paise = budget_rupees * 100
     transcript: list[dict] = []
 
-    # This run owns the external offers it registers. Clearing at the start bounds
-    # the shared in-process catalog so offers from an earlier run cannot pile up or
-    # linger as buyable products — important once a long-lived caller (the Day-3
-    # UI) drives many runs. Assumes one run per process at a time (true for the
-    # proof script and a single-user UI); clear_offers is process-global.
-    offers.clear_offers()
-
     # 1. The product scope. Open vocabulary: understood from the free-text request
     #    by the Intent Compiler LLM (or injected for a deterministic offline run).
     #    This label is what the user signs for; the Gate enforces it, the LLM never
@@ -328,13 +322,21 @@ def run(
     _emit_event(on_event, "intent_understood", category=category)
 
     # 2. The one consent step: mint the agent key, register the signed intent.
-    context = grant_intent(
-        request=request,
-        budget_paise=budget_paise,
-        category=category,
-        search_fn=search_fn,
-        gateway=gateway,
-    )
+    if context is None:
+        context = grant_intent(
+            request=request,
+            budget_paise=budget_paise,
+            category=category,
+            search_fn=search_fn,
+            gateway=gateway,
+        )
+    else:
+        if context.budget_paise != budget_paise or context.category != category:
+            raise ValueError("prepared context does not match this run's budget and category")
+        if search_fn is not None:
+            context.search_fn = search_fn
+        if gateway is not None:
+            context.gateway = gateway
     _event(transcript, "intent_granted", agent_id=context.agent_id, category=category,
            budget_paise=budget_paise, intent_mandate_id=context.intent_mandate_id,
            on_event=on_event)

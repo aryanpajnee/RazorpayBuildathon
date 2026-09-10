@@ -24,6 +24,7 @@ WEBHOOK_EVENTS_DB = DATA_DIR / "webhook_events.db"  # delivered webhook hashes, 
 GATE_NONCES_DB = DATA_DIR / "gate_nonces.db"    # spent cart-mandate nonces, replay defence
 QUOTES_DB = DATA_DIR / "quotes.db"              # issued quotes, looked up by quote_id at gate time
 INTENTS_DB = DATA_DIR / "intents.db"            # granted+verified intents and their purchase counts
+RUN_LOCK_PATH = DATA_DIR / "agent-run.lock"      # cross-process serialization for UI buyer runs
 
 # --- LLM -------------------------------------------------------------------
 # The buyer agent needs reliable tool-calling. A local 8B model emits malformed

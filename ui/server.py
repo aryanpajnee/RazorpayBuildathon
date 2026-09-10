@@ -20,7 +20,7 @@ reusing quote_id/order_id machinery meant for the mandate-enforced cart.
 
 Endpoints:
     POST /api/run          -> SSE stream of one buyer run's events
-    POST /api/reset         -> wipe the demo's ledger/quote/intent/order state
+    GET  /api/runs/{id}    -> capability-protected durable run status
     POST /api/pay           -> create a payment target (real or simulated test-mode)
     POST /api/pay/confirm   -> record the demo's own payment confirmation
     GET  /api/health        -> {"ok": true, "dist_built": <bool>}
@@ -31,15 +31,17 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import Annotated, Literal
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
 import config
 from demo import orchestrator
+from ui.run_store import RunStore
 
 app = FastAPI(title="Vera")
 
@@ -48,23 +50,23 @@ app.add_middleware(
 )
 
 _DIST = Path(__file__).parent / "web" / "dist"
-
-# The demo's own operational state -- the hash-chained ledger plus the
-# ordinary bookkeeping stores a run's mandates/quotes/orders live in.
-# NOT `merchant/webhooks.py`'s WEBHOOK_EVENTS_DB: that module caches its path
-# at import time, so a runtime reset here could never redirect it anyway, and
-# the mission-control dashboard's "fresh chain" promise is about the ledger
-# and the money-path stores a re-run of the demo would otherwise accumulate
-# in, not webhook replay-defence bookkeeping.
-_RESET_DB_PATHS = (
-    "LEDGER_DB", "QUOTES_DB", "INTENTS_DB", "GATE_NONCES_DB", "ORDERS_DB",
-)
+RUN_STORE = RunStore()
 
 
 class RunBody(BaseModel):
-    request: str
-    budget_rupees: int
-    mode: str = config.UI_DEFAULT_MODE
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request: Annotated[StrictStr, Field(min_length=1)]
+    budget_rupees: Annotated[StrictInt, Field(gt=0)]
+    mode: Literal["offline", "live"] = config.UI_DEFAULT_MODE
+
+    @field_validator("request")
+    @classmethod
+    def _request_must_contain_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("request must contain text")
+        return value
 
 
 @app.post("/api/run")
@@ -73,26 +75,59 @@ def run_agent(body: RunBody) -> StreamingResponse:
     `data: <json>\\n\\n` frame per event, the stream ending after exactly one
     terminal event (`run_complete` or `run_error`)."""
 
+    capability = RUN_STORE.create(
+        body.request,
+        body.budget_rupees * config.PAISE_PER_RUPEE,
+        body.mode,
+    )
+
     def _frames():
-        for event in orchestrator.run_streamed(body.request, body.budget_rupees, mode=body.mode):
+        for event in orchestrator.run_streamed(
+            body.request,
+            body.budget_rupees,
+            mode=body.mode,
+            run_id=capability.run_id,
+            run_token=capability.run_token,
+            on_started=lambda: RUN_STORE.mark_running(capability.run_id),
+            on_result=lambda result: RUN_STORE.complete(
+                capability.run_id,
+                status=result.status,
+                reason=result.reason,
+                order_id=result.order_id,
+                quote_id=result.quote_id,
+                amount_paise=result.total_paise,
+                steps=result.steps,
+                llm_calls=result.llm_calls,
+            ),
+            on_error=lambda error: RUN_STORE.fail(capability.run_id, error=error),
+        ):
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(_frames(), media_type="text/event-stream")
 
 
-@app.post("/api/reset")
-def reset() -> dict:
-    """Wipe the demo's ledger + money-path bookkeeping so the next run starts
-    from an empty, genesis-hashed chain. `core.ledger` is deliberately
-    append-only (no update/delete in its public API -- see that module's
-    docstring), so "reset" here means removing the underlying SQLite files
-    themselves; every store re-creates its schema on first use afterwards
-    (each resolves its DB path from `config.*` at call time, so this is safe
-    to do between runs without restarting the process)."""
-    for name in _RESET_DB_PATHS:
-        path: Path = getattr(config, name)
-        path.unlink(missing_ok=True)
-    return {"ok": True}
+@app.get("/api/runs/{run_id}")
+def get_run(
+    run_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer run token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    run_token = authorization.removeprefix("Bearer ")
+    if not run_token or " " in run_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer run token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    record = RUN_STORE.get_owned(run_id, run_token)
+    if record is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return record.as_dict()
 
 
 class ProductInfo(BaseModel):

@@ -27,6 +27,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import uuid
 from typing import Any, Iterator
 
 # Event types that end a stream. Kept here (not imported from elsewhere) so
@@ -42,12 +43,18 @@ _TERMINAL_TYPES = frozenset({"run_complete", "run_error"})
 _CLOSE_SENTINEL = object()
 
 
-def make_event(type: str, seq: int, **payload: Any) -> dict:
+def make_event(type: str, seq: int, *, run_id: str | None = None, **payload: Any) -> dict:
     """Build one stamped event dict. `EventBus.emit` is the normal caller of
     this; it is exposed separately so a test (or a future replay tool) can
     construct an identical event without going through a live bus.
     """
-    return {"seq": seq, "ts": time.time(), "type": type, **payload}
+    return {
+        "run_id": run_id or f"run_{uuid.uuid4().hex}",
+        "seq": seq,
+        "ts": time.time(),
+        "type": type,
+        **payload,
+    }
 
 
 class EventBus:
@@ -59,12 +66,13 @@ class EventBus:
     queue/list append happen under one lock.
     """
 
-    def __init__(self, maxsize: int = 0) -> None:
+    def __init__(self, maxsize: int = 0, *, run_id: str | None = None) -> None:
         self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=maxsize)
         self._lock = threading.Lock()
         self._next_seq = 0
         self._events: list[dict] = []
         self._closed = False
+        self.run_id = run_id or f"run_{uuid.uuid4().hex}"
 
     def emit(self, type: str, **payload: Any) -> dict:
         """Stamp and record one event; return the stamped dict.
@@ -75,7 +83,7 @@ class EventBus:
         what has been emitted so far.
         """
         with self._lock:
-            event = make_event(type, self._next_seq, **payload)
+            event = make_event(type, self._next_seq, run_id=self.run_id, **payload)
             self._next_seq += 1
             self._events.append(event)
             self._queue.put(event)
@@ -122,4 +130,5 @@ class EventBus:
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        with self._lock:
+            return self._closed
