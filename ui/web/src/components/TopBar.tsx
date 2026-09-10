@@ -1,12 +1,10 @@
-// The slim top bar: the "Vera" wordmark and a 4-dot step indicator. Purely
-// a readout of `App`'s step state — it never drives anything itself.
 import type { Step } from "../App";
 
 const STEPS: { id: Step; label: string }[] = [
   { id: "compose", label: "Compose" },
-  { id: "working", label: "Working" },
-  { id: "verdict", label: "Verdict" },
-  { id: "payment", label: "Done" },
+  { id: "working", label: "Search" },
+  { id: "verdict", label: "Review" },
+  { id: "payment", label: "Payment" },
 ];
 
 export default function TopBar({ step }: { step: Step }) {
@@ -14,8 +12,12 @@ export default function TopBar({ step }: { step: Step }) {
 
   return (
     <header className="topbar">
-      <span className="topbar__wordmark">Vera</span>
-      <ol className="topbar__steps" aria-label="Progress">
+      <div className="topbar__inner">
+        <div className="topbar__brand" aria-label="Vera home">
+          <span className="topbar__mark" aria-hidden="true">V</span>
+          <span className="topbar__wordmark" translate="no">Vera</span>
+        </div>
+        <ol className="topbar__steps" aria-label="Shopping progress">
         {STEPS.map((s, i) => {
           const state = i < currentIndex ? "done" : i === currentIndex ? "current" : "upcoming";
           return (
@@ -25,7 +27,9 @@ export default function TopBar({ step }: { step: Step }) {
             </li>
           );
         })}
-      </ol>
+        </ol>
+        <p className="topbar__promise">1 item · your limit</p>
+      </div>
     </header>
   );
 }
