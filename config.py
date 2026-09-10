@@ -24,6 +24,9 @@ WEBHOOK_EVENTS_DB = DATA_DIR / "webhook_events.db"  # delivered webhook hashes, 
 GATE_NONCES_DB = DATA_DIR / "gate_nonces.db"    # spent cart-mandate nonces, replay defence
 QUOTES_DB = DATA_DIR / "quotes.db"              # issued quotes, looked up by quote_id at gate time
 INTENTS_DB = DATA_DIR / "intents.db"            # granted+verified intents and their purchase counts
+USERS_DB = DATA_DIR / "users.db"                # anonymous device credentials + capability hashes
+CONSENTS_DB = DATA_DIR / "consents.db"          # one-use prepared, signed consent records
+CONSENT_MASTER_KEY = KEY_DIR / "consent-master.key"  # encrypts run-scoped agent seeds at rest
 RUN_LOCK_PATH = DATA_DIR / "agent-run.lock"      # cross-process serialization for UI buyer runs
 
 # --- LLM -------------------------------------------------------------------
@@ -384,6 +387,9 @@ SSE_KEEPALIVE_SECONDS = 15.0
 # quota or fires a real Razorpay call. "live" runs the real agent and is
 # selected by a human, on purpose, before recording.
 UI_DEFAULT_MODE = "offline"
+UI_MAX_BUDGET_RUPEES = 1_000_000
+CONSENT_TTL_SECONDS = 300
+DEVICE_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
 
 # Ordered roster for the dashboard's left column — which agent/component
 # "lights up" as the run progresses. Purely DISPLAY metadata: no code path
