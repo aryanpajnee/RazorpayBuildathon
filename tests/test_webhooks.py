@@ -62,6 +62,27 @@ def payment_captured_body(order_id: str, amount: int, payment_id: str = "pay_tes
     return json.dumps(payload).encode("utf-8")
 
 
+def payment_failed_body(order_id: str, amount: int, payment_id: str = "pay_failed01") -> bytes:
+    payload = {
+        "entity": "event",
+        "event": "payment.failed",
+        "contains": ["payment"],
+        "payload": {
+            "payment": {
+                "entity": {
+                    "id": payment_id,
+                    "order_id": order_id,
+                    "amount": amount,
+                    "currency": "INR",
+                    "status": "failed",
+                }
+            }
+        },
+        "created_at": 1234567892,
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
 def order_paid_body(order_id: str, amount: int, receipt: str, payment_id: str = "pay_test002") -> bytes:
     payload = {
         "entity": "event",
@@ -186,6 +207,71 @@ def test_handle_webhook_updates_the_orders_status_after_a_captured_event(tmp_pat
 
     reread = find_by_order_id(order.order_id, db_path=orders_db)
     assert reread.status == "captured"
+
+
+def test_a_captured_webhook_records_the_payment_id_and_captured_amount(tmp_path):
+    """A status alone does not say which payment settled the order, or how
+    much of it was taken. Both travel with the update or the order row cannot
+    tell a full settlement from a partial one."""
+    orders_db = tmp_path / "orders.db"
+    events_db = tmp_path / "events.db"
+    order = create_order("quote_w15", 250000, gateway=FakeGateway(), db_path=orders_db)
+
+    body = payment_captured_body(order.order_id, 250000, payment_id="pay_hook01")
+    handle_webhook(body, sign(body), orders_db_path=orders_db, events_db_path=events_db)
+
+    reread = find_by_order_id(order.order_id, db_path=orders_db)
+    assert reread.status == "captured"
+    assert reread.captured_amount_paise == 250000
+    assert reread.payment_id == "pay_hook01"
+
+
+def test_a_partial_capture_webhook_does_not_settle_the_order(tmp_path):
+    """Razorpay can capture less than the order total. Passing no amount
+    would default the capture to the full order and report a partial capture
+    as a settled order."""
+    orders_db = tmp_path / "orders.db"
+    events_db = tmp_path / "events.db"
+    order = create_order("quote_w16", 500000, gateway=FakeGateway(), db_path=orders_db)
+
+    body = payment_captured_body(order.order_id, 200000, payment_id="pay_partial")
+    handle_webhook(body, sign(body), orders_db_path=orders_db, events_db_path=events_db)
+
+    reread = find_by_order_id(order.order_id, db_path=orders_db)
+    assert reread.status == "partially_captured"
+    assert reread.captured_amount_paise == 200000
+
+
+def test_a_delayed_failed_webhook_cannot_unsettle_a_captured_order(tmp_path):
+    """Razorpay redelivers, and a failure for an abandoned first attempt can
+    land after the capture of the second. The order must not go backwards."""
+    orders_db = tmp_path / "orders.db"
+    events_db = tmp_path / "events.db"
+    order = create_order("quote_w17", 250000, gateway=FakeGateway(), db_path=orders_db)
+
+    captured = payment_captured_body(order.order_id, 250000, payment_id="pay_ok")
+    handle_webhook(captured, sign(captured), orders_db_path=orders_db, events_db_path=events_db)
+
+    failed = payment_failed_body(order.order_id, 250000, payment_id="pay_abandoned")
+    handle_webhook(failed, sign(failed), orders_db_path=orders_db, events_db_path=events_db)
+
+    reread = find_by_order_id(order.order_id, db_path=orders_db)
+    assert reread.status == "captured"
+    assert reread.captured_amount_paise == 250000
+    assert reread.payment_id == "pay_ok"
+
+
+def test_a_failed_webhook_records_nothing_as_captured(tmp_path):
+    orders_db = tmp_path / "orders.db"
+    events_db = tmp_path / "events.db"
+    order = create_order("quote_w18", 250000, gateway=FakeGateway(), db_path=orders_db)
+
+    body = payment_failed_body(order.order_id, 250000, payment_id="pay_nope")
+    handle_webhook(body, sign(body), orders_db_path=orders_db, events_db_path=events_db)
+
+    reread = find_by_order_id(order.order_id, db_path=orders_db)
+    assert reread.status == "failed"
+    assert reread.captured_amount_paise == 0
 
 
 def test_a_replayed_webhook_does_not_call_update_order_status_again(tmp_path, monkeypatch):

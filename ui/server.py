@@ -9,20 +9,20 @@ this file computes a total, verifies a signature, or decides pass/refuse --
 it only serves the built React app and turns one HTTP request into one live
 event stream from the real agent + the real merchant + the real Gate.
 
-This file also owns Vera's own demo-facing checkout step (`/api/pay`,
-`/api/pay/confirm`) -- separate from the frozen money path above, which has
-already run a cart through the mandate/Gate/webhook flow to completion by
-the time a run reaches Verdict. Paying is a second, independent action a
-person takes afterwards, so it gets its own pair of endpoints rather than
-reusing quote_id/order_id machinery meant for the mandate-enforced cart.
+This file also exposes the human checkout step for the *same* order the Gate
+authorised. The browser receives only the existing order's public checkout
+fields. It cannot name an amount, product, quote, order, or gateway; those are
+recovered from the capability-protected run and merchant order stores.
 
     uv run uvicorn ui.server:app --port 8100
 
 Endpoints:
     POST /api/run          -> SSE stream of one buyer run's events
     GET  /api/runs/{id}    -> capability-protected durable run status
-    POST /api/pay           -> create a payment target (real or simulated test-mode)
-    POST /api/pay/confirm   -> record the demo's own payment confirmation
+    POST /api/pay           -> return the run's existing Gate-created order
+    POST /api/pay/confirm   -> verify signature + fetched Razorpay payment
+    POST /api/pay/simulate  -> settle an explicitly simulated order only
+    GET  /api/pay/{run_id}  -> owner-protected verified payment status
     GET  /api/health        -> {"ok": true, "dist_built": <bool>}
     GET  /                  -> the built React app (ui/web/dist), or a "not built" page
 """
@@ -30,18 +30,19 @@ Endpoints:
 from __future__ import annotations
 
 import json
-import uuid
-from typing import Annotated, Literal
 from pathlib import Path
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
 import config
 from demo import orchestrator
-from ui.run_store import RunStore
+from ui import payments
+from ui.payments import PaymentService
+from ui.run_store import RunRecord, RunStore
 
 app = FastAPI(title="Vera")
 
@@ -51,6 +52,7 @@ app.add_middleware(
 
 _DIST = Path(__file__).parent / "web" / "dist"
 RUN_STORE = RunStore()
+PAYMENT_SERVICE = PaymentService()
 
 
 class RunBody(BaseModel):
@@ -106,135 +108,141 @@ def run_agent(body: RunBody) -> StreamingResponse:
     return StreamingResponse(_frames(), media_type="text/event-stream")
 
 
-@app.get("/api/runs/{run_id}")
-def get_run(
-    run_id: str,
+def _bearer_token(
     authorization: Annotated[str | None, Header()] = None,
-) -> dict:
-    if authorization is None or not authorization.startswith("Bearer "):
+) -> str:
+    if authorization is None:
         raise HTTPException(
             status_code=401,
             detail="Bearer run token required",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    run_token = authorization.removeprefix("Bearer ")
-    if not run_token or " " in run_token:
+    scheme, separator, run_token = authorization.partition(" ")
+    malformed = (
+        separator != " "
+        or scheme.lower() != "bearer"
+        or not run_token
+        or run_token.strip() != run_token
+        or any(character.isspace() for character in run_token)
+    )
+    if malformed:
         raise HTTPException(
             status_code=401,
             detail="Bearer run token required",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    return run_token
+
+
+RunToken = Annotated[str, Depends(_bearer_token)]
+
+
+def _owned_run(run_id: str, run_token: str) -> RunRecord:
     record = RUN_STORE.get_owned(run_id, run_token)
     if record is None:
         raise HTTPException(status_code=404, detail="run not found")
-    return record.as_dict()
+    return record
 
 
-class ProductInfo(BaseModel):
-    title: str | None = None
-    url: str | None = None
+@app.get("/api/runs/{run_id}")
+def get_run(run_id: str, run_token: RunToken) -> dict:
+    return _owned_run(run_id, run_token).as_dict()
 
 
 class PayBody(BaseModel):
-    amount_paise: int
-    request: str
-    mode: str = config.UI_DEFAULT_MODE
-    origin: str | None = None  # where to send the browser back after the hosted payment
-    product: ProductInfo | None = None  # what Vera chose — shown on the gateway + receipt
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    run_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
 
 
-def _simulated_payment(amount_paise: int) -> dict:
-    """A clearly-labelled simulated test capture -- no external call. Used only
-    when there are no real Razorpay keys on file (`config.USE_FAKE_GATEWAY`), and
-    as the fallback if a real gateway call fails, so this demo step never
-    dead-ends. Note: a Razorpay TEST-MODE order is itself a test (no real money),
-    so the payment step reaches real netbanking even from a "Test run" agent
-    pass whenever keys are present -- that is the gateway behaviour we want to
-    exercise on camera."""
-    return {
-        "gateway": "test-sim",
-        "order_id": f"test_sim_{uuid.uuid4().hex[:12]}",
-        "amount_paise": amount_paise,
-        "currency": config.CURRENCY,
-    }
+class PayConfirmBody(PayBody):
+    razorpay_payment_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    razorpay_signature: Annotated[StrictStr, Field(min_length=1, max_length=128)]
 
 
-@app.post("/api/pay")
-def pay(body: PayBody) -> dict:
-    """Create a payment target for Vera's checkout step.
-
-    Once the Gate has authorised the cart, the payment agent sends the buyer
-    straight to the Razorpay gateway to pay. To make that a genuine "you are now
-    on the gateway" hand-off (not a fragile in-page modal), this creates a
-    Razorpay TEST-MODE **Payment Link** -- a hosted Razorpay page -- and returns
-    its `payment_url`; the frontend redirects the browser there. On success
-    Razorpay sends the browser back to `origin/?vera_paid=1`.
-
-    This is deliberately NOT the frozen money path's `merchant.gateway.create_order`
-    (the mandate-enforced cart already cleared the Gate); it is Vera's own
-    demo checkout. Falls back to a clearly-labelled simulated capture only when
-    there are no real Razorpay keys on file, so the step never dead-ends."""
-    if config.USE_FAKE_GATEWAY:
-        return _simulated_payment(body.amount_paise)
-
-    try:
-        import razorpay
-
-        client = razorpay.Client(auth=(config.RAZORPAY_KEY_ID, config.RAZORPAY_KEY_SECRET))
-        product_title = body.product.title if body.product and body.product.title else body.request
-        payload: dict = {
-            "amount": body.amount_paise,
-            "currency": config.CURRENCY,
-            "accept_partial": False,
-            "reference_id": f"vera_{uuid.uuid4().hex[:12]}",
-            "description": f"Vera — {product_title}"[:250],
-            "reminder_enable": False,
-        }
-        # Carry what Vera bought onto the Razorpay order: the product shows on
-        # the hosted gateway (via description) and is recorded on the payment
-        # (via notes).
-        notes: dict = {}
-        if body.product and body.product.title:
-            notes["product_title"] = body.product.title[:255]
-        if body.product and body.product.url:
-            notes["product_url"] = body.product.url[:255]
-        if notes:
-            payload["notes"] = notes
-        if body.origin:
-            payload["callback_url"] = f"{body.origin.rstrip('/')}/?vera_paid=1"
-            payload["callback_method"] = "get"
-        link = client.payment_link.create(payload)
-        return {
-            "gateway": "razorpay",
-            "payment_url": link["short_url"],
-            "order_id": link["id"],
-            "amount_paise": body.amount_paise,
-            "currency": config.CURRENCY,
-        }
-    except Exception:
-        # Never expose the key secret, and never let a gateway hiccup dead-end
-        # the demo -- fall back to the same simulated shape.
-        return _simulated_payment(body.amount_paise)
-
-
-class PayConfirmBody(BaseModel):
+class CheckoutResponse(BaseModel):
+    gateway: Literal["test-sim", "razorpay"]
     order_id: str
-    razorpay_payment_id: str | None = None
-    razorpay_signature: str | None = None
+    amount_paise: StrictInt
+    currency: str
+    key_id: str | None = None
+
+
+class PaymentStatusResponse(BaseModel):
+    status: Literal["pending", "partially_captured", "paid", "failed"]
+    gateway: Literal["test-sim", "razorpay"]
+    order_id: str
+    payment_id: str | None
+    amount_paise: StrictInt
+    captured_amount_paise: StrictInt
+    currency: str
+    reconciled: bool
+    test_mode: bool
+
+
+def _payment_http_error(exc: payments.PaymentError) -> HTTPException:
+    """Map named, sanitised payment failures to stable HTTP semantics."""
+    if isinstance(exc, payments.InvalidCheckoutSignatureError):
+        return HTTPException(status_code=400, detail="invalid Razorpay checkout signature")
+    if isinstance(exc, payments.PaymentVerificationError):
+        return HTTPException(status_code=400, detail="Razorpay payment did not match the order")
+    if isinstance(exc, payments.PaymentLookupError):
+        return HTTPException(status_code=502, detail="Razorpay payment verification unavailable")
+    if isinstance(exc, payments.GatewayConfigurationError):
+        return HTTPException(status_code=503, detail="payment gateway is not safely configured")
+    if isinstance(
+        exc,
+        (
+            payments.RunNotPayableError,
+            payments.PurchaseRecordMismatchError,
+            payments.SimulationNotAllowedError,
+        ),
+    ):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=400, detail="payment request refused")
+
+
+@app.post("/api/pay", response_model_exclude_none=True)
+def pay(body: PayBody, run_token: RunToken) -> CheckoutResponse:
+    """Return the existing Gate-created order; this operation creates nothing."""
+    record = _owned_run(body.run_id, run_token)
+    try:
+        return CheckoutResponse(**PAYMENT_SERVICE.checkout(record))
+    except payments.PaymentError as exc:
+        raise _payment_http_error(exc) from exc
 
 
 @app.post("/api/pay/confirm")
-def pay_confirm(body: PayConfirmBody) -> dict:
-    """Record Vera's own demo payment confirmation. Deliberately NOT a
-    reimplementation of the frozen webhook/signature-verify path in
-    `merchant/webhooks.py` (unchanged, untouched) -- this just closes out the
-    UI's own checkout step for display."""
-    return {
-        "status": "paid",
-        "order_id": body.order_id,
-        "method": "netbanking",
-        "test_mode": True,
-    }
+def pay_confirm(body: PayConfirmBody, run_token: RunToken) -> PaymentStatusResponse:
+    record = _owned_run(body.run_id, run_token)
+    try:
+        return PaymentStatusResponse(
+            **PAYMENT_SERVICE.confirm(
+                record,
+                payment_id=body.razorpay_payment_id,
+                signature=body.razorpay_signature,
+            )
+        )
+    except payments.PaymentError as exc:
+        raise _payment_http_error(exc) from exc
+
+
+@app.post("/api/pay/simulate")
+def pay_simulate(body: PayBody, run_token: RunToken) -> PaymentStatusResponse:
+    record = _owned_run(body.run_id, run_token)
+    try:
+        return PaymentStatusResponse(**PAYMENT_SERVICE.simulate(record))
+    except payments.PaymentError as exc:
+        raise _payment_http_error(exc) from exc
+
+
+@app.get("/api/pay/{run_id}")
+def pay_status(run_id: str, run_token: RunToken) -> PaymentStatusResponse:
+    record = _owned_run(run_id, run_token)
+    try:
+        return PaymentStatusResponse(**PAYMENT_SERVICE.status(record))
+    except payments.PaymentError as exc:
+        raise _payment_http_error(exc) from exc
 
 
 @app.get("/api/health")

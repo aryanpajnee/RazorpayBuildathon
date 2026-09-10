@@ -46,6 +46,17 @@ the *call*, and makes the claim itself atomic:
    order_id. This is the only write that ever makes a row look "done", and
    it is the row every other caller (including `find_by_order_id`) reads.
 
+--- Design: the row is also the settlement record --------------------------
+
+The same row later carries what happened to the order's money: which gateway
+created it (so "may this be simulated?" is answered from provenance, never
+from whatever config says at read time), which payment settled it, and how
+much of the total was actually captured. `update_order_status` is the only
+way in, and it is monotonic -- captured amounts only rise, a settled order
+never unsettles, and a capture short of the total is stored as a partial one.
+Out-of-order webhooks are the norm, not the exception, so "write the status
+the caller asked for" was never a safe rule. See that function's docstring.
+
 **Honest residual window.** This closes the race for any reservation whose
 owner is still alive and working -- which is the actual cross-process race
 described in FAILURES.md. It does not (and structurally cannot, without a
@@ -78,6 +89,44 @@ _ORDER_COLUMNS = (
 _STATUS_PENDING = "pending"
 _STATUS_RECLAIMING = "reclaiming"
 _STATUS_CREATED = "created"
+_STATUS_AUTHORIZED = "authorized"
+_STATUS_PARTIALLY_CAPTURED = "partially_captured"
+_STATUS_CAPTURED = "captured"
+_STATUS_PAID = "paid"
+_STATUS_FAILED = "failed"
+
+# The statuses a settlement update may ask for. Closed on purpose: this is the
+# only table that says whether money moved, so a caller with a typo ("capture",
+# "success") must fail loudly rather than write a status nothing else in the
+# system knows how to read. The reservation statuses are deliberately absent --
+# nothing may drive a created order back into an unclaimed reservation.
+_SETTLEMENT_STATUSES = frozenset(
+    {
+        _STATUS_CREATED,
+        _STATUS_AUTHORIZED,
+        _STATUS_PARTIALLY_CAPTURED,
+        _STATUS_CAPTURED,
+        _STATUS_PAID,
+        _STATUS_FAILED,
+    }
+)
+# Statuses that mean some amount of money has already been taken. A later
+# event must never walk an order back out of this set.
+_SETTLED_STATUSES = frozenset(
+    {_STATUS_PARTIALLY_CAPTURED, _STATUS_CAPTURED, _STATUS_PAID}
+)
+_FULLY_SETTLED_STATUSES = frozenset({_STATUS_CAPTURED, _STATUS_PAID})
+
+# Which gateway actually created a row. Recorded rather than inferred, because
+# "may this order be simulated?" and "may this order be confirmed against a
+# real Razorpay signature?" are answered from provenance, and inferring
+# provenance from config at read time would let an env change reclassify an
+# order that already exists. GATEWAY_UNKNOWN is what a pre-provenance row
+# migrates to, and it is refused by both paths -- fail closed, never "probably
+# real".
+GATEWAY_RAZORPAY = "razorpay"
+GATEWAY_TEST_SIM = "test-sim"
+GATEWAY_UNKNOWN = "unknown"
 
 # How long a caller who finds someone else's still-open reservation will
 # poll before concluding it was abandoned (a crash between reserve and
@@ -214,7 +263,7 @@ class FakeGateway:
     (or was not) hit a second time.
     """
 
-    gateway_name = "test-sim"
+    gateway_name = GATEWAY_TEST_SIM
     key_id = None
 
     def __init__(self) -> None:
@@ -242,7 +291,7 @@ class RazorpayGateway:
         import razorpay  # imported here, not at module scope, to keep the
         # fake-gateway path free of a hard dependency on network config.
 
-        self.gateway_name = "razorpay"
+        self.gateway_name = GATEWAY_RAZORPAY
         self.key_id = config.RAZORPAY_KEY_ID
         self._client = razorpay.Client(auth=(self.key_id, config.RAZORPAY_KEY_SECRET))
 
@@ -271,6 +320,86 @@ def _default_gateway():
     return FakeGateway() if config.USE_FAKE_GATEWAY else RazorpayGateway()
 
 
+# A database created by *this* version already has every column; the ALTERs
+# below exist only for one created by an earlier version. Keeping the
+# fresh-create path and the upgrade path separate is what lets each backfill
+# run exactly once -- in the connection that actually added the column it
+# repairs -- instead of on every connection, which would take a write lock on
+# the orders table thousands of times a run to rewrite nothing.
+_CREATE_ORDERS_TABLE = f"""
+    CREATE TABLE IF NOT EXISTS orders (
+        quote_id TEXT PRIMARY KEY,
+        order_id TEXT,
+        amount_paise INTEGER NOT NULL,
+        currency TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        gateway TEXT NOT NULL DEFAULT '{GATEWAY_UNKNOWN}',
+        gateway_key_id TEXT,
+        payment_id TEXT,
+        captured_amount_paise INTEGER NOT NULL DEFAULT 0
+    )
+"""
+
+_COLUMN_MIGRATIONS = (
+    (
+        "gateway",
+        f"ALTER TABLE orders ADD COLUMN gateway TEXT NOT NULL "
+        f"DEFAULT '{GATEWAY_UNKNOWN}'",
+    ),
+    ("gateway_key_id", "ALTER TABLE orders ADD COLUMN gateway_key_id TEXT"),
+    ("payment_id", "ALTER TABLE orders ADD COLUMN payment_id TEXT"),
+    (
+        "captured_amount_paise",
+        "ALTER TABLE orders ADD COLUMN captured_amount_paise INTEGER NOT NULL DEFAULT 0",
+    ),
+)
+
+# FakeGateway ids are exactly "order_fake" plus a six-digit counter, and this
+# GLOB matches that and nothing else. The looser `LIKE 'order_fake%'` was
+# rejected: a real Razorpay order id is "order_" plus fourteen characters, so
+# it cannot match a fixed-length GLOB however its random suffix falls out,
+# whereas a prefix match could in principle label a real order as simulatable
+# -- and a simulatable order can be marked paid with no money having moved.
+# Every other pre-provenance row stays GATEWAY_UNKNOWN and is refused at
+# checkout.
+_BACKFILL_FAKE_PROVENANCE = (
+    f"UPDATE orders SET gateway = '{GATEWAY_TEST_SIM}' "
+    f"WHERE gateway = '{GATEWAY_UNKNOWN}' "
+    "AND order_id GLOB 'order_fake[0-9][0-9][0-9][0-9][0-9][0-9]'"
+)
+
+# A pre-provenance row that already said captured/paid was, by the semantics of
+# the day, fully settled. Leaving 0 in the new column would read as "not one
+# paisa captured" and immediately downgrade a settled order to
+# partially_captured on the next update.
+_BACKFILL_CAPTURED_AMOUNT = (
+    "UPDATE orders SET captured_amount_paise = amount_paise "
+    f"WHERE status IN ('{_STATUS_CAPTURED}', '{_STATUS_PAID}') "
+    "AND captured_amount_paise = 0"
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring a pre-existing orders database up to the current column set.
+
+    Safe and repeatable: a column is added only when absent, and a backfill
+    runs only in the connection that added the column it repairs, so opening
+    an old database twice does the work once and opening a current one does
+    no work at all.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+    added = set()
+    for column, statement in _COLUMN_MIGRATIONS:
+        if column not in columns:
+            conn.execute(statement)
+            added.add(column)
+    if "gateway" in added:
+        conn.execute(_BACKFILL_FAKE_PROVENANCE)
+    if "captured_amount_paise" in added:
+        conn.execute(_BACKFILL_CAPTURED_AMOUNT)
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     """`isolation_level=None` puts the connection in autocommit mode, which
     is what lets this module issue `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`
@@ -281,42 +410,8 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS orders (
-            quote_id TEXT PRIMARY KEY,
-            order_id TEXT,
-            amount_paise INTEGER NOT NULL,
-            currency TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    # Existing demo databases predate payment reconciliation metadata. Add
-    # each field independently so opening an old database remains safe and
-    # repeatable. Legacy fake ids can be classified without trusting config;
-    # other legacy rows stay ``unknown`` and therefore fail closed at checkout.
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
-    migrations = {
-        "gateway": "ALTER TABLE orders ADD COLUMN gateway TEXT NOT NULL DEFAULT 'unknown'",
-        "gateway_key_id": "ALTER TABLE orders ADD COLUMN gateway_key_id TEXT",
-        "payment_id": "ALTER TABLE orders ADD COLUMN payment_id TEXT",
-        "captured_amount_paise": (
-            "ALTER TABLE orders ADD COLUMN captured_amount_paise INTEGER NOT NULL DEFAULT 0"
-        ),
-    }
-    for column, statement in migrations.items():
-        if column not in columns:
-            conn.execute(statement)
-    conn.execute(
-        "UPDATE orders SET gateway = 'test-sim' "
-        "WHERE gateway = 'unknown' AND order_id LIKE 'order_fake%'"
-    )
-    conn.execute(
-        "UPDATE orders SET captured_amount_paise = amount_paise "
-        "WHERE status IN ('captured', 'paid') AND captured_amount_paise = 0"
-    )
+    conn.execute(_CREATE_ORDERS_TABLE)
+    _migrate(conn)
     return conn
 
 
@@ -381,6 +476,19 @@ def _try_claim_or_read(conn: sqlite3.Connection, quote_id: str, amount_paise: in
         conn.execute("ROLLBACK")  # read-only so far; release the lock immediately
         if existing.amount_paise != amount_paise:
             raise AmountMismatchError(quote_id, amount_paise, existing.amount_paise)
+        # An order_id is the whole test, deliberately without also requiring
+        # status == 'created'. Only _finalize ever writes an order_id, and it
+        # writes one only for an order the gateway confirmed -- so a non-null
+        # order_id *is* "a real order exists for this quote_id", whatever the
+        # settlement status has since become. Pairing it with status ==
+        # 'created' (as this used to) meant that once a webhook moved the row
+        # to captured/failed, a re-entering caller no longer recognised its
+        # own finished order: it fell through to "pending", waited out the
+        # window, and then found _try_reclaim equally unable to classify it
+        # (not pending either), so it looped forever -- and had reclaim ever
+        # succeeded, it would have created a second real order for an order
+        # already paid. Status decides what to do *with* an order; it never
+        # decides whether one exists.
         if existing.order_id:
             return "cached", existing
         return "pending", None
@@ -422,6 +530,8 @@ def _try_reclaim(conn: sqlite3.Connection, quote_id: str, amount_paise: int) -> 
     if existing.amount_paise != amount_paise:
         conn.execute("ROLLBACK")
         raise AmountMismatchError(quote_id, amount_paise, existing.amount_paise)
+    # Same rule as _try_claim_or_read: a row that already carries an order_id
+    # is a finished order, never a reservation to take over.
     if existing.order_id:
         conn.execute("ROLLBACK")
         return "cached", existing
@@ -642,21 +752,42 @@ def update_order_status(
     payment_id: str | None = None,
     db_path: Path | None = None,
 ) -> Order:
-    """Apply a monotonic settlement update to a merchant-created order.
+    """Apply a monotonic settlement update to an order this merchant created.
 
-    Payment attempts may arrive out of order. A later failure or authorised
-    event must never erase an earlier partial/full capture, while a later
-    successful attempt may recover a failed order. Partial captures are kept
-    distinct from full settlement. The read/decision/write occurs under one
-    ``BEGIN IMMEDIATE`` transaction so concurrent webhook workers cannot race
-    a settled order backwards.
+    Payment events do not arrive in the order they happened. Razorpay retries
+    a webhook it got no 200 for, a `payment.failed` for an abandoned first
+    attempt can land after the `payment.captured` of the second, and the
+    checkout-confirm path writes the same fact the webhook is about to write.
+    So this is not "write the caller's status": it is a decision about which
+    of two facts about the same order is the later truth about money.
+
+    Three rules, in the order they are applied:
+
+    1. **Captured amounts only ever go up.** `captured_amount_paise` is
+       `max(recorded, requested)`. A replayed or stale event cannot subtract
+       money that was already taken.
+    2. **A settled order never unsettles.** Once partially_captured, captured
+       or paid, a later `failed`/`authorized`/`created` is recorded as *not
+       having happened to the status* -- it is a fact about one payment
+       attempt, not about the order.
+    3. **Partial is not full.** A `captured` update whose running total is
+       still short of the order amount is stored as `partially_captured`.
+       "Money arrived" and "the order is settled" are different claims, and
+       only the second may ever be shown to a buyer as paid.
+
+    The read, the decision and the write all happen inside one
+    `BEGIN IMMEDIATE` transaction. A plain UPDATE would be atomic on its own,
+    but the *decision* is what needs protecting: two webhook workers could
+    otherwise both read `captured` and both write, the loser's stale
+    conclusion landing last and walking the order backwards.
     """
-    allowed = {"created", "authorized", "partially_captured", "captured", "paid", "failed"}
-    if status not in allowed:
+    if status not in _SETTLEMENT_STATUSES:
         raise ValueError(f"unsupported order status: {status!r}")
     if captured_amount_paise is not None:
+        # type(...) is int, not isinstance: bool subclasses int, and True
+        # would otherwise record a one-paisa capture.
         if type(captured_amount_paise) is not int or captured_amount_paise <= 0:
-            raise ValueError("captured_amount_paise must be a positive integer")
+            raise ValueError("captured_amount_paise must be a positive int paise value")
     if payment_id is not None and (not isinstance(payment_id, str) or not payment_id):
         raise ValueError("payment_id must be a non-empty string")
 
@@ -671,9 +802,16 @@ def update_order_status(
         existing = _row_to_order(row, from_cache=True)
 
         requested_capture = captured_amount_paise
-        if status in {"captured", "paid"} and requested_capture is None:
+        if status in _FULLY_SETTLED_STATUSES and requested_capture is None:
+            # captured/paid with no amount named means the whole order; the
+            # alternative (defaulting to 0) would record full settlement with
+            # nothing captured, which is the exact shape of the bug this
+            # function exists to prevent.
             requested_capture = existing.amount_paise
         if requested_capture is not None and requested_capture > existing.amount_paise:
+            # Nobody may capture more than this merchant quoted. Raised, not
+            # clamped: a clamp would quietly turn an impossible event into a
+            # plausible-looking settlement.
             conn.execute("ROLLBACK")
             raise AmountMismatchError(
                 existing.quote_id, requested_capture, existing.amount_paise
@@ -681,22 +819,34 @@ def update_order_status(
 
         next_capture = max(existing.captured_amount_paise, requested_capture or 0)
         requested_status = status
-        if status == "captured" and next_capture < existing.amount_paise:
-            requested_status = "partially_captured"
+        if status == _STATUS_CAPTURED and next_capture < existing.amount_paise:
+            requested_status = _STATUS_PARTIALLY_CAPTURED
 
-        settled = existing.status in {"partially_captured", "captured", "paid"}
-        full_settlement = existing.status in {"captured", "paid"}
-        if status in {"failed", "authorized", "created"} and settled:
+        settled = existing.status in _SETTLED_STATUSES
+        fully_settled = existing.status in _FULLY_SETTLED_STATUSES
+        if settled and requested_status in {
+            _STATUS_FAILED,
+            _STATUS_AUTHORIZED,
+            _STATUS_CREATED,
+        }:
             next_status = existing.status
-            next_payment_id = existing.payment_id
-        elif full_settlement and requested_status == "partially_captured":
+        elif fully_settled and requested_status == _STATUS_PARTIALLY_CAPTURED:
             next_status = existing.status
-            next_payment_id = existing.payment_id
-        elif existing.status == "paid" and requested_status == "captured":
-            next_status = "paid"
-            next_payment_id = existing.payment_id or payment_id
+        elif existing.status == _STATUS_PAID and requested_status == _STATUS_CAPTURED:
+            # order.paid is Razorpay's own statement that the order settled in
+            # full; a payment.captured arriving afterwards describes the same
+            # money and must not demote that.
+            next_status = _STATUS_PAID
         else:
             next_status = requested_status
+
+        # The payment id that settled an order is evidence and is kept. A
+        # later attempt on the same order (Razorpay allows several) may not
+        # overwrite the id of the one that actually took the money; before
+        # anything is settled, the newest attempt is the interesting one.
+        if settled and existing.payment_id:
+            next_payment_id = existing.payment_id
+        else:
             next_payment_id = payment_id or existing.payment_id
 
         conn.execute(

@@ -233,7 +233,29 @@ def handle_webhook(
         # redelivery is then recognised as a replay and -- correctly, per
         # the no-double-apply rule -- never retries the status write, so the
         # order would be stuck at the wrong status forever.
-        gateway.update_order_status(order_id, state, db_path=orders_db_path)
+        #
+        # What is handed to gateway.update_order_status matters as much as
+        # when. `state` is what the *event* means; the order's resulting
+        # status is gateway.py's decision, because only it can see what was
+        # already recorded. Two things must travel with it:
+        #   - the captured amount, for capture/settlement events only. A
+        #     payment.captured may legitimately carry less than the order
+        #     total (see the partial-capture check above), and passing the
+        #     amount is what lets gateway.py store that as
+        #     partially_captured instead of full settlement. Omitting it
+        #     would default the capture to the full order amount and report
+        #     a partial capture as paid.
+        #   - the payment id, so the order row records which payment settled
+        #     it rather than only that something did.
+        # A payment.failed carries no captured amount: nothing was taken.
+        captured = amount_paise if state in {"captured", "paid"} else None
+        gateway.update_order_status(
+            order_id,
+            state,
+            captured_amount_paise=captured,
+            payment_id=payment_id,
+            db_path=orders_db_path,
+        )
 
         try:
             conn.execute(
