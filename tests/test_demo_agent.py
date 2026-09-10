@@ -53,6 +53,32 @@ def test_happy_path_places_one_order():
     assert res.steps == 3 and res.llm_calls == 3
 
 
+def test_purchase_stops_later_tool_calls_from_the_same_model_batch():
+    gw = FakeGateway()
+    model = fixtures.ScriptedModel(
+        turns=[[
+            {"name": "list_with_merchant", "args": {
+                "title": fixtures.CHEAP_SHOE.title,
+                "url": fixtures.CHEAP_SHOE.url,
+                "price_paise": fixtures.CHEAP_SHOE.price_paise,
+                "source": fixtures.CHEAP_SHOE.source,
+            }, "id": "list"},
+            {"name": "sign_and_submit", "args": {}, "id": "first-buy"},
+            {"name": "sign_and_submit", "args": {}, "id": "second-buy"},
+        ]]
+    )
+
+    res = agent.run(
+        "running shoes", 9000, category="footwear", model=model,
+        search_fn=fixtures.fake_search, gateway=gw,
+    )
+
+    assert res.status == "ordered"
+    assert gw.calls == 1
+    calls = [e["name"] for e in res.transcript if e["kind"] == "tool_call"]
+    assert calls == ["list_with_merchant", "sign_and_submit"]
+
+
 def test_missing_model_returns_honest_status_not_a_traceback(monkeypatch):
     # Live path with no Gemini key: run() must return an honest RunResult, never
     # let MissingAPIKeyError escape.

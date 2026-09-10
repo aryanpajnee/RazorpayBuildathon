@@ -442,6 +442,10 @@ def run(
             _event(transcript, "tool_result", name=name, result=out, on_event=on_event)
             _emit_tool_side_effects(on_event, context, name, args, quote_id_before, gate_result_before)
             messages.append(ToolMessage(content=out, tool_call_id=call_id))
+            if context.finished or context.order is not None:
+                # Do not execute later calls from the same model batch after a
+                # purchase or an ambiguous gateway outcome ends the run.
+                break
 
     # Search prices are advisory rather than authoritative, but when every priced
     # result is already above the signed ceiling we can state that no-buy reason

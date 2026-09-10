@@ -98,6 +98,7 @@ class ToolContext:
     finished: bool = False
     summary: str | None = None
     order: object = None             # merchant.gateway.Order once a Gate PASS creates one
+    uncertain_order: bool = False    # Gate passed but gateway outcome needs reconciliation
 
     # --- Day-3: display/telemetry ONLY, for demo/agent.py's live event feed ---
     # Neither field is ever read back into a money decision -- they exist so the
@@ -154,7 +155,7 @@ def grant_intent(
         agent_pubkey=vk.encode().hex(),
         category=category,
         max_paise=budget_paise,
-        max_purchases=5,
+        max_purchases=1,
         ttl_seconds=3600,
     )
     intent_store.register_intent(intent_payload)
@@ -360,6 +361,14 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
         Gate, which enforces your signed budget and every signature itself. With
         no quote_id, submits the most recently listed quote. Returns PASS with an
         order id, or REFUSED with the reason (which you can recover from)."""
+        if context.order is not None:
+            return (
+                f"Run already committed to order {context.order.order_id}; "
+                "no further purchase tools may run."
+            )
+        if context.finished:
+            return "Run already finished; no further purchase tools may run."
+
         qid = quote_id or context.last_quote_id
         if not qid or qid not in context.quotes:
             return "No quote to submit — call list_with_merchant first to get a quote_id."
@@ -403,9 +412,28 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
                 notes={"agent_id": context.agent_id, "quote_id": quote.quote_id},
                 gateway=context.gateway,
             )
-        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
-            return f"GATE PASSED but order creation failed ({type(exc).__name__}: {exc})."
+        except gateway.AmountMismatchError as exc:
+            # Detected locally before any external call, so no order was made.
+            intent_store.release_authority(result.cart_mandate_id)
+            return f"GATE PASSED but order creation was refused ({type(exc).__name__}: {exc})."
+        except Exception as exc:  # noqa: BLE001 — outcome may be ambiguous; never auto-retry
+            context.finished = True
+            context.uncertain_order = True
+            context.summary = (
+                "The Gate reserved this purchase, but the gateway outcome is uncertain. "
+                "The authority remains reserved for reconciliation; nothing else was submitted."
+            )
+            return (
+                f"GATE PASSED but order creation failed ({type(exc).__name__}: {exc}). "
+                "The outcome may be uncertain, so authority remains reserved and this run "
+                "must not retry automatically."
+            )
 
+        if order.from_cache:
+            # Returning an existing idempotent order did not make a new purchase.
+            intent_store.release_authority(result.cart_mandate_id)
+        else:
+            intent_store.commit_authority(result.cart_mandate_id)
         context.order = order
         return (
             f"GATE PASS — order {order.order_id} created for {_rupees(order.amount_paise)}. "

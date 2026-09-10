@@ -12,7 +12,7 @@ it's fine:
 
     a. Ed25519 signature valid, and the chain of authority it names is real
     b. Intent mandate not expired
-    c. Total <= the intent's max_paise (plus currency, category, purchase count)
+    c. Cumulative reserved spend <= max_paise (plus currency, category, purchase count)
     d. cart_hash matches the quote the merchant issued
     e. Quote within its TTL
     f. Nonce unseen (replay defence, SQLite-backed, atomic insert)
@@ -320,7 +320,7 @@ def check(cart_envelope: dict, *, now: int | None = None) -> GateResult:
     gate_total = compute_total(list(quote.lines)).total_paise
     ctx.gate_total_paise = gate_total
 
-    # --- (c) currency, over-limit, category, purchase count --------------
+    # --- (c) currency, per-cart limit and category -------------------------
     if payload["currency"] != intent["currency"] or payload["currency"] != config.CURRENCY:
         return _refuse(
             ctx,
@@ -362,15 +362,6 @@ def check(cart_envelope: dict, *, now: int | None = None) -> GateResult:
                 f"intent only authorises {intent['category']!r}",
                 {"sku": line.sku, "product_category": product["category"], "intent_category": intent["category"]},
             )
-
-    used = intent_store.purchases_used(intent["mandate_id"])
-    if used >= intent["max_purchases"]:
-        return _refuse(
-            ctx,
-            PURCHASES_EXHAUSTED,
-            "intent mandate's purchase count is exhausted",
-            {"purchases_used": used, "max_purchases": intent["max_purchases"]},
-        )
 
     # --- (d) cart hash matches the merchant's own quote --------------------
     if payload["cart_hash"] != quote.cart_hash:
@@ -437,6 +428,41 @@ def check(cart_envelope: dict, *, now: int | None = None) -> GateResult:
             {"quoted_total_paise": quote.total_paise, "current_total_paise": current_total},
         )
 
-    # --- pass --------------------------------------------------------------
-    intent_store.record_purchase(intent["mandate_id"])
-    return _pass(ctx)
+    # --- atomic authority reservation and pass ----------------------------
+    # This is the check-and-increment. Keeping count and cumulative spend in
+    # one BEGIN IMMEDIATE transaction prevents two workers from both seeing
+    # the same remaining authority and then committing separate purchases.
+    reservation = intent_store.reserve_authority(
+        intent["mandate_id"], ctx.cart_mandate_id, gate_total
+    )
+    if not reservation.reserved and reservation.reason == "purchase_count":
+        return _refuse(
+            ctx,
+            PURCHASES_EXHAUSTED,
+            "intent mandate's purchase count is exhausted",
+            {
+                "purchases_used": reservation.purchases_used,
+                "max_purchases": reservation.max_purchases,
+            },
+        )
+    if not reservation.reserved:
+        return _refuse(
+            ctx,
+            OVER_LIMIT,
+            "cart total exceeds the intent's remaining run budget",
+            {
+                "limit_paise": reservation.max_paise,
+                "spent_paise": reservation.spent_paise,
+                "remaining_paise": reservation.remaining_paise,
+                "over_by_paise": gate_total - reservation.remaining_paise,
+            },
+        )
+
+    try:
+        return _pass(ctx)
+    except Exception:
+        # No caller can create an order without receiving the passing result.
+        # If audit persistence itself fails, return the authority to the run so
+        # a fresh cart can retry rather than silently stranding the reservation.
+        intent_store.release_authority(ctx.cart_mandate_id)
+        raise

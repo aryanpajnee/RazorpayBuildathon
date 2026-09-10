@@ -475,6 +475,19 @@ def test_gate_refuses_purchases_exhausted():
     assert_refused(second, "PURCHASES_EXHAUSTED")
 
 
+def test_gate_enforces_max_paise_across_multiple_purchases():
+    case = make_valid_case(max_paise=KNOWN_TOTAL_PAISE * 2 - 1, max_purchases=3)
+    assert_passed(check(case["envelope"], now=case["quote"].issued_at + 1))
+
+    quote2 = create_quote(resolve_lines([{"sku": FOOTWEAR_SKU, "qty": 1}]))
+    save_quote(quote2)
+    second = check(build_cart_envelope(case, quote2), now=quote2.issued_at + 1)
+
+    assert_refused(second, "OVER_LIMIT")
+    assert second.detail["spent_paise"] == KNOWN_TOTAL_PAISE
+    assert second.detail["remaining_paise"] == KNOWN_TOTAL_PAISE - 1
+
+
 # ---------------------------------------------------------------------------
 # (d) quote resolution
 # ---------------------------------------------------------------------------

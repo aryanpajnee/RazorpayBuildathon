@@ -24,7 +24,7 @@ config.WEBHOOK_EVENTS_DB = _tmp / "webhook_events.db"
 
 from demo import tools  # noqa: E402
 from demo.search import SearchResult  # noqa: E402
-from merchant import offers  # noqa: E402
+from merchant import intent_store, offers  # noqa: E402
 from merchant.gateway import FakeGateway  # noqa: E402
 
 
@@ -120,6 +120,25 @@ def test_sign_and_submit_refused_over_ceiling_does_not_call_gateway():
     assert "GATE REFUSED" in out and "OVER_LIMIT" in out
     assert ctx.order is None
     assert gw.calls == 0  # no order was ever created for a refused cart
+
+
+def test_sign_and_submit_keeps_reservation_on_ambiguous_gateway_error():
+    class FailingGateway:
+        def create_order(self, amount_paise, currency, receipt, notes):
+            raise RuntimeError("connection dropped")
+
+    ctx = _ctx(9000, gw=FailingGateway())
+    t = _tools_by_name(ctx)
+    t["list_with_merchant"].func(
+        title="StreetFlex Running Sneakers", url="https://ex.test/a", price_paise=105_900
+    )
+    out = t["sign_and_submit"].func()
+
+    assert "outcome may be uncertain" in out
+    assert ctx.finished is True and ctx.uncertain_order is True
+    reservation_id = ctx.last_gate_result.cart_mandate_id
+    assert intent_store.reservation_status(reservation_id) == "reserved"
+    assert intent_store.authority_usage(ctx.intent_mandate_id)[0] == 1
 
 
 def test_submit_attempt_cap_stops_submitting():
