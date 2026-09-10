@@ -126,15 +126,13 @@ def test_sign_and_submit_refused_over_ceiling_does_not_call_gateway():
 
 
 def test_sign_and_submit_keeps_reservation_on_ambiguous_gateway_error():
-    class FailingGateway:
+    class FailingGateway(FakeGateway):
         def create_order(self, amount_paise, currency, receipt, notes):
             raise RuntimeError("connection dropped")
 
     ctx = _ctx(9000, gw=FailingGateway())
     t = _tools_by_name(ctx)
-    t["list_with_merchant"].func(
-        title="StreetFlex Running Sneakers", url="https://ex.test/a", price_paise=105_900
-    )
+    t["list_with_merchant"].func(candidate_id=_candidate_id(ctx, t))
     out = t["sign_and_submit"].func()
 
     assert "outcome may be uncertain" in out

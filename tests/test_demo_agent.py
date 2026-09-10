@@ -58,16 +58,18 @@ def test_happy_path_places_one_order():
 def test_purchase_stops_later_tool_calls_from_the_same_model_batch():
     gw = FakeGateway()
     model = fixtures.ScriptedModel(
-        turns=[[
-            {"name": "list_with_merchant", "args": {
-                "title": fixtures.CHEAP_SHOE.title,
-                "url": fixtures.CHEAP_SHOE.url,
-                "price_paise": fixtures.CHEAP_SHOE.price_paise,
-                "source": fixtures.CHEAP_SHOE.source,
-            }, "id": "list"},
-            {"name": "sign_and_submit", "args": {}, "id": "first-buy"},
-            {"name": "sign_and_submit", "args": {}, "id": "second-buy"},
-        ]]
+        turns=[
+            [{"name": "web_search", "args": {"query": "running shoes"}, "id": "search"}],
+            [
+                {
+                    "name": "list_with_merchant",
+                    "args": {"candidate_id": "$candidate_1"},
+                    "id": "list",
+                },
+                {"name": "sign_and_submit", "args": {}, "id": "first-buy"},
+                {"name": "sign_and_submit", "args": {}, "id": "second-buy"},
+            ],
+        ]
     )
 
     res = agent.run(
@@ -78,7 +80,7 @@ def test_purchase_stops_later_tool_calls_from_the_same_model_batch():
     assert res.status == "ordered"
     assert gw.calls == 1
     calls = [e["name"] for e in res.transcript if e["kind"] == "tool_call"]
-    assert calls == ["list_with_merchant", "sign_and_submit"]
+    assert calls == ["web_search", "list_with_merchant", "sign_and_submit"]
 
 
 def test_missing_model_returns_honest_status_not_a_traceback(monkeypatch):
