@@ -167,24 +167,23 @@ def _emit_product_chosen(on_event: "Callable[..., None] | None", context, args: 
     """
     if on_event is None:
         return
-    arg_title = args.get("title") if isinstance(args.get("title"), str) else ""
-    arg_url = args.get("url") if isinstance(args.get("url"), str) else ""
-    arg_source = args.get("source") if isinstance(args.get("source"), str) else "external"
+    candidate_id = args.get("candidate_id") if isinstance(args.get("candidate_id"), str) else ""
 
     candidates = context.last_candidates or []
-    match = next((c for c in candidates if arg_url and c.get("url") == arg_url), None)
-    if match is None:
-        match = next((c for c in candidates if arg_title and c.get("title") == arg_title), None)
+    match = next(
+        (c for c in candidates if candidate_id and c.get("candidate_id") == candidate_id),
+        None,
+    )
     match = match or {}
 
     _emit_event(
         on_event,
         "product_chosen",
-        title=match.get("title") or arg_title or "Unknown item",
-        url=match.get("url") or arg_url or "",
+        title=match.get("title") or "Unknown item",
+        url=match.get("url") or "",
         seller=match.get("seller"),
         price_display=match.get("price_display"),
-        source=match.get("source") or arg_source,
+        source=match.get("source") or "unknown",
     )
 
 

@@ -338,6 +338,8 @@ OFFER_MARGIN_BPS = 0   # merchant margin over the sourced price, in basis points
                         # 0 = relist at the sourced price. The merchant still
                         # owns this number — it is never the web's price verbatim.
 OFFER_SOURCE_TAG = "external_offer"
+OFFERS_DB = DATA_DIR / "offers.db"
+CANDIDATES_DB = DATA_DIR / "candidates.db"
 
 # Deterministic (no-LLM) keyword routing from a free-text web-find title into
 # one of CATALOG_CATEGORIES, so the Gate's exact-string category check still

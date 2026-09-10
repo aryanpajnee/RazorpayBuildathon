@@ -84,6 +84,15 @@ def get_product(sku: str) -> dict:
     for product in all_products():
         if product["sku"] == sku:
             return product
+    if sku.startswith(config.OFFER_SKU_PREFIX):
+        # Lazy import avoids a catalog/offers import cycle. External offers are
+        # immutable SQLite records so Gate re-resolution also works after a
+        # process restart or in another worker.
+        from merchant import offers
+
+        offer = offers.get_offer(sku)
+        if offer is not None:
+            return offer.as_product()
     raise ProductNotFound(sku)
 
 

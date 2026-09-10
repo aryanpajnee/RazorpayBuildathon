@@ -29,6 +29,7 @@ resolves to a real `config.CATALOG_CATEGORIES` entry.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -157,6 +158,12 @@ def fake_search(query: str, *, max_results: int | None = None) -> list[SearchRes
     return list(results[:limit])
 
 
+# The provenance boundary recognizes this exact server-side marker.  It makes
+# fixture prices eligible only for simulated checkout; ordinary injected or
+# live search functions are advisory by default.
+fake_search.__vera_candidate_authority__ = "trusted_demo"
+
+
 # --------------------------------------------------------------------------- #
 # 2. A scripted tool-calling model
 # --------------------------------------------------------------------------- #
@@ -202,7 +209,21 @@ class ScriptedModel:
         if isinstance(turn, str):
             return AIMessage(content=turn, tool_calls=[])
 
-        return AIMessage(content="", tool_calls=list(turn))
+        candidate_ids: list[str] = []
+        for message in messages:
+            content = getattr(message, "content", "")
+            if isinstance(content, str):
+                candidate_ids.extend(re.findall(r"candidate_id:\s*(cand_[a-f0-9]+)", content))
+        calls = []
+        for original in turn:
+            call = {**original, "args": dict(original.get("args") or {})}
+            for key, value in call["args"].items():
+                if isinstance(value, str) and value.startswith("$candidate_"):
+                    index = int(value.rsplit("_", 1)[1]) - 1
+                    if 0 <= index < len(candidate_ids):
+                        call["args"][key] = candidate_ids[index]
+            calls.append(call)
+        return AIMessage(content="", tool_calls=calls)
 
     @property
     def calls_made(self) -> int:
@@ -230,12 +251,7 @@ def happy_path_script() -> ScriptedModel:
             [
                 _tool_call(
                     "list_with_merchant",
-                    {
-                        "title": CHEAP_SHOE.title,
-                        "url": CHEAP_SHOE.url,
-                        "price_paise": CHEAP_SHOE.price_paise,
-                        "source": CHEAP_SHOE.source,
-                    },
+                    {"candidate_id": "$candidate_1"},
                     "call_2",
                 )
             ],
@@ -256,12 +272,7 @@ def recovery_script() -> ScriptedModel:
             [
                 _tool_call(
                     "list_with_merchant",
-                    {
-                        "title": OVER_BUDGET_SHOE.title,
-                        "url": OVER_BUDGET_SHOE.url,
-                        "price_paise": OVER_BUDGET_SHOE.price_paise,
-                        "source": OVER_BUDGET_SHOE.source,
-                    },
+                    {"candidate_id": "$candidate_2"},
                     "call_2",
                 )
             ],
@@ -271,12 +282,7 @@ def recovery_script() -> ScriptedModel:
             [
                 _tool_call(
                     "list_with_merchant",
-                    {
-                        "title": CHEAP_SHOE.title,
-                        "url": CHEAP_SHOE.url,
-                        "price_paise": CHEAP_SHOE.price_paise,
-                        "source": CHEAP_SHOE.source,
-                    },
+                    {"candidate_id": "$candidate_1"},
                     "call_6",
                 )
             ],
@@ -298,12 +304,7 @@ def headphones_script() -> ScriptedModel:
             [
                 _tool_call(
                     "list_with_merchant",
-                    {
-                        "title": CHEAP_HEADPHONES.title,
-                        "url": CHEAP_HEADPHONES.url,
-                        "price_paise": CHEAP_HEADPHONES.price_paise,
-                        "source": CHEAP_HEADPHONES.source,
-                    },
+                    {"candidate_id": "$candidate_1"},
                     "call_2",
                 )
             ],

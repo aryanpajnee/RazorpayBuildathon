@@ -54,12 +54,27 @@ iterates).
 from __future__ import annotations
 
 import hashlib
+import re
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 
 import config
-from merchant import catalog
+from merchant import candidate_store, catalog
 
 _REGISTERED: set[str] = set()
+
+_CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS external_offers (
+    sku TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    unit_paise INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    stock INTEGER NOT NULL,
+    url TEXT,
+    source TEXT NOT NULL
+)
+"""
 
 
 class OfferError(Exception):
@@ -150,6 +165,52 @@ def normalize_category(text: str) -> str:
     return " ".join((text or "").strip().lower().split())[: config.CATEGORY_MAX_LEN]
 
 
+def candidate_matches_scope(title: str, snippet: str, category: str) -> bool:
+    """Check captured product evidence against the signed scope.
+
+    The search query is intentionally excluded: asking for shoes is not proof
+    that a returned toaster is footwear.
+    """
+    category = normalize_category(category)
+    evidence = f"{title} {snippet}".lower()
+    known = config.CATEGORY_KEYWORDS.get(category)
+    if known is not None:
+        return any(keyword in evidence for keyword in known)
+    tokens = [token for token in re.findall(r"[a-z0-9]+", category) if len(token) >= 3]
+    evidence_tokens = set(re.findall(r"[a-z0-9]+", evidence))
+    return any(
+        {token, token.rstrip("s"), token + "s"} & evidence_tokens
+        for token in tokens
+    )
+
+
+def create_offer_from_candidate(
+    *, candidate_id: str, intent_mandate_id: str, intent_category: str,
+) -> Offer:
+    """Create a simulation offer using only a server-captured candidate row."""
+    candidate = candidate_store.get(candidate_id)
+    if candidate is None:
+        raise OfferError("unknown candidate_id; search first and select a server-issued candidate")
+    if candidate.intent_mandate_id != intent_mandate_id:
+        raise OfferError("candidate_id belongs to a different authorised run")
+    if candidate.authority != "trusted_demo":
+        raise OfferError(
+            "external search data is advisory and has no verified merchant price; "
+            "checkout is blocked until a merchant adapter verifies it"
+        )
+    if candidate.price_paise is None:
+        raise OfferError("candidate has no trusted demo price")
+    if not candidate_matches_scope(candidate.title, candidate.snippet, intent_category):
+        raise OfferError("candidate product evidence does not match the signed product scope")
+    return create_offer(
+        title=candidate.title,
+        url=candidate.url,
+        price_paise=candidate.price_paise,
+        category=intent_category,
+        source="trusted_demo_fixture",
+    )
+
+
 def _live_products() -> list[dict]:
     """The SAME list object `catalog.all_products()` / `catalog.get_product()`
     iterate, courtesy of `load_catalog`'s `@lru_cache(maxsize=1)`. Appending
@@ -157,6 +218,28 @@ def _live_products() -> list[dict]:
     docstring for why this is the intended mechanism, not a workaround.
     """
     return catalog.load_catalog()["products"]
+
+
+def _connect(db_path: Path | None = None) -> sqlite3.Connection:
+    path = db_path or config.OFFERS_DB
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute(_CREATE_TABLE_SQL)
+    return conn
+
+
+def get_offer(sku: str, *, db_path: Path | None = None) -> Offer | None:
+    """Resolve an immutable persisted offer in this or another process."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT sku, name, unit_paise, category, stock, url, source "
+            "FROM external_offers WHERE sku = ?",
+            (sku,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return Offer(*row) if row else None
 
 
 def create_offer(
@@ -193,11 +276,9 @@ def create_offer(
     away — a future demo tweak to `OFFER_MARGIN_BPS` should not have to touch
     this function to start working.
 
-    Sku: `config.OFFER_SKU_PREFIX + sha1(url or title)[:10].upper()`. Hashing
-    the url when present (falling back to the title only when there is no
-    url) makes the sku deterministic AND idempotent — the same web find,
-    found again in a later search or by a retried agent turn, maps to the
-    same sku and is never appended twice. This is also why the registration
+    Sku includes every immutable price/category observation. A later search
+    that sees the same URL at a different price therefore gets a different
+    offer rather than silently resolving an old URL-hash SKU. This is also why the registration
     step below checks `sku not in _REGISTERED` before appending: calling
     `create_offer` twice for the same find is a normal, expected path (the
     buyer's recovery agent re-quoting after a refusal, e.g.), not an error.
@@ -233,9 +314,8 @@ def create_offer(
         price_paise * config.OFFER_MARGIN_BPS + config.BPS_DIVISOR // 2
     ) // config.BPS_DIVISOR + price_paise
 
-    sku = config.OFFER_SKU_PREFIX + hashlib.sha1(
-        (url or title).encode("utf-8")
-    ).hexdigest()[:10].upper()
+    identity = "\x1f".join((url or "", title.strip(), str(price_paise), category, source))
+    sku = config.OFFER_SKU_PREFIX + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16].upper()
 
     offer = Offer(
         sku=sku,
@@ -250,6 +330,24 @@ def create_offer(
     if sku not in _REGISTERED:
         _live_products().append(offer.as_product())
         _REGISTERED.add(sku)
+
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO external_offers "
+            "(sku, name, unit_paise, category, stock, url, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (offer.sku, offer.name, offer.unit_paise, offer.category,
+             offer.stock, offer.url, offer.source),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT sku, name, unit_paise, category, stock, url, source "
+            "FROM external_offers WHERE sku = ?", (sku,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if Offer(*row) != offer:
+        raise OfferError(f"immutable persisted offer collision for {sku}")
 
     return offer
 
@@ -270,6 +368,12 @@ def clear_offers() -> None:
     products = _live_products()
     products[:] = [p for p in products if p["sku"] not in _REGISTERED]
     _REGISTERED.clear()
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM external_offers")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def registered_skus() -> list[str]:

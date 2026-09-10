@@ -19,6 +19,8 @@ config.GATE_NONCES_DB = _tmp / "gate_nonces.db"
 config.INTENTS_DB = _tmp / "intents.db"
 config.ORDERS_DB = _tmp / "orders.db"
 config.WEBHOOK_EVENTS_DB = _tmp / "webhook_events.db"
+config.CANDIDATES_DB = _tmp / "candidates.db"
+config.OFFERS_DB = _tmp / "offers.db"
 
 import pytest  # noqa: E402
 

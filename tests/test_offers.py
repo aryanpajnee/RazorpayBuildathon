@@ -19,10 +19,11 @@ from merchant import catalog, offers
 
 
 @pytest.fixture(autouse=True)
-def _clean_offers():
+def _clean_offers(tmp_path, monkeypatch):
     """Clear before AND after: before, in case a previous failed run left
     something registered; after, so nothing this test registered survives
     into test_catalog.py / test_gate.py."""
+    monkeypatch.setattr(config, "OFFERS_DB", tmp_path / "offers.db")
     offers.clear_offers()
     yield
     offers.clear_offers()
@@ -84,6 +85,32 @@ def test_create_offer_sku_is_deterministic_and_idempotent():
 
     matching = [p for p in catalog.all_products() if p["sku"] == o1.sku]
     assert len(matching) == 1, "the same find must not be listed twice"
+
+
+def test_same_url_at_a_new_price_gets_a_new_immutable_offer():
+    first = offers.create_offer(
+        title="Endure Trail Shoe", url="https://example.com/changing",
+        price_paise=100_000, category="footwear",
+    )
+    second = offers.create_offer(
+        title="Endure Trail Shoe", url="https://example.com/changing",
+        price_paise=120_000, category="footwear",
+    )
+    assert first.sku != second.sku
+    assert catalog.get_product(first.sku)["price_paise"] == 100_000
+    assert catalog.get_product(second.sku)["price_paise"] == 120_000
+
+
+def test_persisted_offer_resolves_after_process_local_registration_is_lost():
+    offer = offers.create_offer(
+        title="Durable Running Shoe", url="https://example.com/durable",
+        price_paise=150_000, category="footwear",
+    )
+    catalog.load_catalog()["products"][:] = [
+        product for product in catalog.all_products() if product["sku"] != offer.sku
+    ]
+    offers._REGISTERED.clear()
+    assert catalog.get_product(offer.sku) == offer.as_product()
 
 
 def test_create_offer_sku_falls_back_to_title_hash_when_no_url():
