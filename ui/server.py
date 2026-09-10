@@ -17,7 +17,9 @@ recovered from the capability-protected run and merchant order stores.
     uv run uvicorn ui.server:app --port 8100
 
 Endpoints:
-    POST /api/run          -> SSE stream of one buyer run's events
+    POST /api/device/register -> pin a fresh anonymous browser-device key
+    POST /api/consent/prepare -> return exact canonical consent bytes to sign
+    POST /api/run          -> consume signed consent, then stream one buyer run
     GET  /api/runs/{id}    -> capability-protected durable run status
     POST /api/pay           -> return the run's existing Gate-created order
     POST /api/pay/confirm   -> verify signature + fetched Razorpay payment
@@ -40,7 +42,10 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_v
 
 import config
 from demo import orchestrator
+from demo.intent import consent_category
+from merchant.user_registry import DeviceCredential, UserRegistry
 from ui import payments
+from ui.consent import ConsentError, ConsentStore
 from ui.payments import PaymentService
 from ui.run_store import RunRecord, RunStore
 
@@ -53,13 +58,74 @@ app.add_middleware(
 _DIST = Path(__file__).parent / "web" / "dist"
 RUN_STORE = RunStore()
 PAYMENT_SERVICE = PaymentService()
+USER_REGISTRY = UserRegistry()
+CONSENT_STORE = ConsentStore()
 
 
-class RunBody(BaseModel):
+class DeviceRegistrationBody(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    request: Annotated[StrictStr, Field(min_length=1)]
-    budget_rupees: Annotated[StrictInt, Field(gt=0)]
+    public_key: Annotated[
+        StrictStr, Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
+    ]
+
+
+class DeviceRegistrationResponse(BaseModel):
+    user_id: str
+    device_token: str
+    public_key: str
+    expires_at: int
+
+
+def _device_credential(
+    authorization: Annotated[str | None, Header()] = None,
+) -> DeviceCredential:
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer device token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = authorization.removeprefix("Bearer ")
+    if not token or " " in token:
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer device token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    credential = USER_REGISTRY.authenticate(token)
+    if credential is None:
+        raise HTTPException(
+            status_code=401,
+            detail="device token is invalid or expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credential
+
+
+DeviceToken = Annotated[DeviceCredential, Depends(_device_credential)]
+
+
+@app.post("/api/device/register", response_model=DeviceRegistrationResponse)
+def register_device(body: DeviceRegistrationBody) -> DeviceRegistrationResponse:
+    credential = USER_REGISTRY.register_anonymous(body.public_key)
+    return DeviceRegistrationResponse(
+        user_id=credential.user_id,
+        device_token=credential.device_token,
+        public_key=credential.public_key,
+        expires_at=credential.expires_at,
+    )
+
+
+class ConsentPrepareBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request: Annotated[
+        StrictStr, Field(min_length=1, max_length=config.CONSENT_MAX_REQUEST_CHARS)
+    ]
+    budget_rupees: Annotated[
+        StrictInt, Field(gt=0, le=config.UI_MAX_BUDGET_RUPEES)
+    ]
     mode: Literal["offline", "live"] = config.UI_DEFAULT_MODE
 
     @field_validator("request")
@@ -71,11 +137,98 @@ class RunBody(BaseModel):
         return value
 
 
+class ConsentPrepareResponse(BaseModel):
+    consent_id: str
+    payload: dict
+    canonical_payload: str
+    expires_at: int
+
+
+@app.post("/api/consent/prepare", response_model=ConsentPrepareResponse)
+def prepare_consent(
+    body: ConsentPrepareBody,
+    credential: DeviceToken,
+) -> ConsentPrepareResponse:
+    category = (
+        config.CONSENT_OFFLINE_CATEGORY
+        if body.mode == "offline"
+        else consent_category(body.request)
+    )
+    prepared = CONSENT_STORE.prepare(
+        credential,
+        request=body.request,
+        budget_paise=body.budget_rupees * config.PAISE_PER_RUPEE,
+        category=category,
+        mode=body.mode,
+    )
+    return ConsentPrepareResponse(
+        consent_id=prepared.consent_id,
+        payload=prepared.payload,
+        canonical_payload=prepared.canonical_payload,
+        expires_at=prepared.expires_at,
+    )
+
+
+class RunBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request: Annotated[
+        StrictStr, Field(min_length=1, max_length=config.CONSENT_MAX_REQUEST_CHARS)
+    ]
+    budget_rupees: Annotated[
+        StrictInt, Field(gt=0, le=config.UI_MAX_BUDGET_RUPEES)
+    ]
+    mode: Literal["offline", "live"] = config.UI_DEFAULT_MODE
+    consent_id: Annotated[StrictStr, Field(pattern=r"^consent_[0-9a-f]{32}$")]
+    consent: "SignedConsent"
+
+    @field_validator("request")
+    @classmethod
+    def _request_must_contain_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("request must contain text")
+        return value
+
+
+class SignedConsent(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    payload: dict
+    signature: Annotated[
+        StrictStr, Field(min_length=128, max_length=128, pattern=r"^[0-9a-fA-F]{128}$")
+    ]
+    public_key: Annotated[
+        StrictStr, Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
+    ]
+    alg: Literal["Ed25519"]
+
+
 @app.post("/api/run")
-def run_agent(body: RunBody) -> StreamingResponse:
+def run_agent(body: RunBody, credential: DeviceToken) -> StreamingResponse:
     """Stream one buyer run as SSE frames, exactly per EVENT_SCHEMA.md: one
     `data: <json>\\n\\n` frame per event, the stream ending after exactly one
     terminal event (`run_complete` or `run_error`)."""
+
+    try:
+        context = CONSENT_STORE.consume(
+            credential,
+            consent_id=body.consent_id,
+            envelope=body.consent.model_dump(),
+            request=body.request,
+            budget_paise=body.budget_rupees * config.PAISE_PER_RUPEE,
+            mode=body.mode,
+        )
+    except ConsentError as exc:
+        status_code = {
+            "consent_not_found": 404,
+            "consent_replayed": 409,
+            "consent_expired": 410,
+        }.get(exc.code, 400)
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
 
     capability = RUN_STORE.create(
         body.request,
@@ -102,6 +255,7 @@ def run_agent(body: RunBody) -> StreamingResponse:
                 llm_calls=result.llm_calls,
             ),
             on_error=lambda error: RUN_STORE.fail(capability.run_id, error=error),
+            context=context,
         ):
             yield f"data: {json.dumps(event)}\n\n"
 

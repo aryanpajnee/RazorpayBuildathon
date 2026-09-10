@@ -98,6 +98,7 @@ def run_streamed(
         run_kwargs = _offline_kwargs() if mode == "offline" else _live_kwargs()
         if context is not None:
             run_kwargs["context"] = context
+            run_kwargs["category"] = context.category
 
         def _worker() -> None:
             try:

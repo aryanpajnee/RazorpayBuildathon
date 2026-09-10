@@ -7,6 +7,7 @@ agent key.  Agent seeds are encrypted under a server-only key file (mode 0600).
 
 from __future__ import annotations
 
+import fcntl
 import hmac
 import json
 import os
@@ -22,8 +23,9 @@ from nacl.signing import SigningKey
 
 import config
 from core.mandate import canonical, generate_keypair, make_intent_mandate
-from demo.tools import ApprovedIntent, grant_intent
+from demo.tools import ApprovedIntent, ApprovedIntentError, grant_intent
 from merchant.user_registry import DeviceCredential
+from merchant.offers import normalize_category
 
 
 class ConsentError(RuntimeError):
@@ -41,23 +43,33 @@ class PreparedConsent:
 
 
 def _master_key(path: Path) -> bytes:
+    """Load or create the server key while serialising first-use across workers."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        pass
-    else:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        info = os.fstat(descriptor)
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o077:
+            raise PermissionError(
+                f"consent master key permissions must be 0600, got {mode:04o}"
+            )
+        key = os.read(descriptor, SecretBox.KEY_SIZE + 1)
+        if not key:
+            key = os.urandom(SecretBox.KEY_SIZE)
+            os.write(descriptor, key)
+            os.fsync(descriptor)
+        if len(key) != SecretBox.KEY_SIZE:
+            raise RuntimeError("consent master key has an invalid length")
+        return key
+    finally:
         try:
-            os.write(descriptor, os.urandom(SecretBox.KEY_SIZE))
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & 0o077:
-        raise PermissionError(f"consent master key permissions must be 0600, got {mode:04o}")
-    key = path.read_bytes()
-    if len(key) != SecretBox.KEY_SIZE:
-        raise RuntimeError("consent master key has an invalid length")
-    return key
 
 
 class ConsentStore:
@@ -100,10 +112,16 @@ class ConsentStore:
                 agent_secret BLOB NOT NULL,
                 expires_at INTEGER NOT NULL,
                 status TEXT NOT NULL CHECK (status IN ('prepared', 'consumed')),
-                consumed_at INTEGER
+                consumed_at INTEGER,
+                envelope_json TEXT
             )
             """
         )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(prepared_consents)").fetchall()
+        }
+        if "envelope_json" not in columns:
+            conn.execute("ALTER TABLE prepared_consents ADD COLUMN envelope_json TEXT")
         return conn
 
     def prepare(
@@ -116,11 +134,22 @@ class ConsentStore:
         mode: str,
         now: int | None = None,
     ) -> PreparedConsent:
+        if not isinstance(request, str) or not request.strip():
+            raise ValueError("request must contain text")
+        if len(request) > config.CONSENT_MAX_REQUEST_CHARS:
+            raise ValueError("request is too long")
         if type(budget_paise) is not int or budget_paise <= 0:
             raise ValueError("budget_paise must be a positive integer")
+        if budget_paise > config.UI_MAX_BUDGET_RUPEES * config.PAISE_PER_RUPEE:
+            raise ValueError("budget exceeds the UI maximum")
         if mode not in {"offline", "live"}:
             raise ValueError("mode must be 'offline' or 'live'")
         issued_at = int(time.time()) if now is None else now
+        if issued_at >= credential.expires_at:
+            raise ConsentError("device_expired", "device credential has expired")
+        category = normalize_category(category)
+        if not category:
+            raise ValueError("category must contain text")
         consent_id = f"consent_{uuid.uuid4().hex}"
         agent_sk, agent_vk = generate_keypair()
         agent_id = f"agent_{agent_vk.encode().hex()[:16]}"
@@ -188,7 +217,11 @@ class ConsentStore:
                 raise ConsentError("consent_expired", "consent has expired")
             if row["request_text"] != request or row["budget_paise"] != budget_paise or row["mode"] != mode:
                 raise ConsentError("run_mismatch", "run request, budget, or mode differs from signed consent")
-            if not isinstance(envelope, dict) or envelope.get("public_key") != credential.public_key:
+            if not isinstance(envelope, dict) or set(envelope) != {
+                "payload", "signature", "public_key", "alg"
+            }:
+                raise ConsentError("signature_invalid", "signed consent envelope is malformed")
+            if envelope.get("public_key") != credential.public_key:
                 raise ConsentError("signer_mismatch", "consent signer is not the registered device")
             raw_payload = envelope.get("payload")
             try:
@@ -205,22 +238,27 @@ class ConsentStore:
             payload = json.loads(row["payload_json"])
             approved = ApprovedIntent(
                 envelope=envelope,
+                trusted_user_id=credential.user_id,
                 trusted_user_public_key=credential.public_key,
                 agent_signing_key=agent_sk,
             )
-            context = grant_intent(
-                request=request,
-                budget_paise=budget_paise,
-                category=row["category"],
-                mode=mode,
-                approved=approved,
-                search_fn=search_fn,
-                gateway=gateway,
-            )
+            try:
+                context = grant_intent(
+                    request=request,
+                    budget_paise=budget_paise,
+                    category=row["category"],
+                    approved=approved,
+                    search_fn=search_fn,
+                    gateway=gateway,
+                )
+            except ApprovedIntentError as exc:
+                raise ConsentError(exc.code, str(exc)) from exc
+            envelope_json = canonical(envelope).decode("utf-8")
             updated = conn.execute(
-                "UPDATE prepared_consents SET status = 'consumed', consumed_at = ? "
+                "UPDATE prepared_consents "
+                "SET status = 'consumed', consumed_at = ?, envelope_json = ? "
                 "WHERE consent_id = ? AND status = 'prepared'",
-                (checked_at, consent_id),
+                (checked_at, envelope_json, consent_id),
             )
             if updated.rowcount != 1:
                 raise ConsentError("consent_replayed", "consent has already been consumed")
