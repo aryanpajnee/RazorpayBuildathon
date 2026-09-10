@@ -70,7 +70,10 @@ import config
 
 ORDERS_DB = config.ORDERS_DB
 
-_ORDER_COLUMNS = "quote_id, order_id, amount_paise, currency, status, created_at"
+_ORDER_COLUMNS = (
+    "quote_id, order_id, amount_paise, currency, status, created_at, "
+    "gateway, gateway_key_id, payment_id, captured_amount_paise"
+)
 
 _STATUS_PENDING = "pending"
 _STATUS_RECLAIMING = "reclaiming"
@@ -168,6 +171,10 @@ class Order:
     currency: str
     status: str
     created_at: str
+    gateway: str
+    gateway_key_id: str | None
+    payment_id: str | None
+    captured_amount_paise: int
     from_cache: bool
 
     def as_dict(self) -> dict:
@@ -178,6 +185,10 @@ class Order:
             "currency": self.currency,
             "status": self.status,
             "created_at": self.created_at,
+            "gateway": self.gateway,
+            "gateway_key_id": self.gateway_key_id,
+            "payment_id": self.payment_id,
+            "captured_amount_paise": self.captured_amount_paise,
             "from_cache": self.from_cache,
         }
 
@@ -202,6 +213,9 @@ class FakeGateway:
     exact ids are possible and `.calls` lets a test prove the gateway was
     (or was not) hit a second time.
     """
+
+    gateway_name = "test-sim"
+    key_id = None
 
     def __init__(self) -> None:
         self.calls = 0
@@ -228,7 +242,9 @@ class RazorpayGateway:
         import razorpay  # imported here, not at module scope, to keep the
         # fake-gateway path free of a hard dependency on network config.
 
-        self._client = razorpay.Client(auth=(config.RAZORPAY_KEY_ID, config.RAZORPAY_KEY_SECRET))
+        self.gateway_name = "razorpay"
+        self.key_id = config.RAZORPAY_KEY_ID
+        self._client = razorpay.Client(auth=(self.key_id, config.RAZORPAY_KEY_SECRET))
 
     def create_order(self, amount_paise: int, currency: str, receipt: str, notes: dict) -> dict:
         return self._client.order.create(
@@ -245,6 +261,10 @@ class RazorpayGateway:
                 "payment_capture": 1,
             }
         )
+
+    def fetch_payment(self, payment_id: str) -> dict:
+        """Fetch one payment using server-held Razorpay credentials."""
+        return self._client.payment.fetch(payment_id)
 
 
 def _default_gateway():
@@ -273,11 +293,46 @@ def _connect(db_path: Path) -> sqlite3.Connection:
         )
         """
     )
+    # Existing demo databases predate payment reconciliation metadata. Add
+    # each field independently so opening an old database remains safe and
+    # repeatable. Legacy fake ids can be classified without trusting config;
+    # other legacy rows stay ``unknown`` and therefore fail closed at checkout.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+    migrations = {
+        "gateway": "ALTER TABLE orders ADD COLUMN gateway TEXT NOT NULL DEFAULT 'unknown'",
+        "gateway_key_id": "ALTER TABLE orders ADD COLUMN gateway_key_id TEXT",
+        "payment_id": "ALTER TABLE orders ADD COLUMN payment_id TEXT",
+        "captured_amount_paise": (
+            "ALTER TABLE orders ADD COLUMN captured_amount_paise INTEGER NOT NULL DEFAULT 0"
+        ),
+    }
+    for column, statement in migrations.items():
+        if column not in columns:
+            conn.execute(statement)
+    conn.execute(
+        "UPDATE orders SET gateway = 'test-sim' "
+        "WHERE gateway = 'unknown' AND order_id LIKE 'order_fake%'"
+    )
+    conn.execute(
+        "UPDATE orders SET captured_amount_paise = amount_paise "
+        "WHERE status IN ('captured', 'paid') AND captured_amount_paise = 0"
+    )
     return conn
 
 
 def _row_to_order(row: tuple, *, from_cache: bool) -> Order:
-    quote_id, order_id, amount_paise, currency, status, created_at = row
+    (
+        quote_id,
+        order_id,
+        amount_paise,
+        currency,
+        status,
+        created_at,
+        gateway_name,
+        gateway_key_id,
+        payment_id,
+        captured_amount_paise,
+    ) = row
     return Order(
         order_id=order_id,
         quote_id=quote_id,
@@ -285,6 +340,10 @@ def _row_to_order(row: tuple, *, from_cache: bool) -> Order:
         currency=currency,
         status=status,
         created_at=created_at,
+        gateway=gateway_name,
+        gateway_key_id=gateway_key_id,
+        payment_id=payment_id,
+        captured_amount_paise=captured_amount_paise,
         from_cache=from_cache,
     )
 
@@ -322,7 +381,7 @@ def _try_claim_or_read(conn: sqlite3.Connection, quote_id: str, amount_paise: in
         conn.execute("ROLLBACK")  # read-only so far; release the lock immediately
         if existing.amount_paise != amount_paise:
             raise AmountMismatchError(quote_id, amount_paise, existing.amount_paise)
-        if existing.status == _STATUS_CREATED and existing.order_id:
+        if existing.order_id:
             return "cached", existing
         return "pending", None
 
@@ -363,7 +422,7 @@ def _try_reclaim(conn: sqlite3.Connection, quote_id: str, amount_paise: int) -> 
     if existing.amount_paise != amount_paise:
         conn.execute("ROLLBACK")
         raise AmountMismatchError(quote_id, amount_paise, existing.amount_paise)
-    if existing.status == _STATUS_CREATED and existing.order_id:
+    if existing.order_id:
         conn.execute("ROLLBACK")
         return "cached", existing
     if existing.status != _STATUS_PENDING:
@@ -424,6 +483,8 @@ def _finalize(
     currency: str,
     status: str,
     created_at: str,
+    gateway_name: str,
+    gateway_key_id: str | None,
 ) -> None:
     """Write the gateway's confirmed result back to the row this call
     exclusively owns, marking it `created`. This is the only write that
@@ -432,9 +493,18 @@ def _finalize(
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
-            "UPDATE orders SET order_id = ?, currency = ?, status = ?, created_at = ? "
+            "UPDATE orders SET order_id = ?, currency = ?, status = ?, created_at = ?, "
+            "gateway = ?, gateway_key_id = ? "
             "WHERE quote_id = ?",
-            (order_id, currency, status, created_at, quote_id),
+            (
+                order_id,
+                currency,
+                status,
+                created_at,
+                gateway_name,
+                gateway_key_id,
+                quote_id,
+            ),
         )
         conn.execute("COMMIT")
     finally:
@@ -519,7 +589,19 @@ def create_order(
     created_at = datetime.now(timezone.utc).isoformat()
     currency = raw.get("currency", config.CURRENCY)
     status = raw.get("status", _STATUS_CREATED)
-    _finalize(db_path, quote_id, order_id, confirmed_amount, currency, status, created_at)
+    gateway_name = getattr(gateway, "gateway_name", "unknown")
+    gateway_key_id = getattr(gateway, "key_id", None)
+    _finalize(
+        db_path,
+        quote_id,
+        order_id,
+        confirmed_amount,
+        currency,
+        status,
+        created_at,
+        gateway_name,
+        gateway_key_id,
+    )
 
     return Order(
         order_id=order_id,
@@ -528,6 +610,10 @@ def create_order(
         currency=currency,
         status=status,
         created_at=created_at,
+        gateway=gateway_name,
+        gateway_key_id=gateway_key_id,
+        payment_id=None,
+        captured_amount_paise=0,
         from_cache=False,
     )
 
@@ -548,22 +634,82 @@ def find_by_order_id(order_id: str, db_path: Path | None = None) -> Order | None
         conn.close()
 
 
-def update_order_status(order_id: str, status: str, *, db_path: Path | None = None) -> Order:
-    """Write a new status back to the order this merchant created.
+def update_order_status(
+    order_id: str,
+    status: str,
+    *,
+    captured_amount_paise: int | None = None,
+    payment_id: str | None = None,
+    db_path: Path | None = None,
+) -> Order:
+    """Apply a monotonic settlement update to a merchant-created order.
 
-    This module owns the `orders` table -- webhooks.py must never write to
-    it directly, only call this. A single UPDATE is already atomic in
-    SQLite, so this does not need any extra locking beyond that.
+    Payment attempts may arrive out of order. A later failure or authorised
+    event must never erase an earlier partial/full capture, while a later
+    successful attempt may recover a failed order. Partial captures are kept
+    distinct from full settlement. The read/decision/write occurs under one
+    ``BEGIN IMMEDIATE`` transaction so concurrent webhook workers cannot race
+    a settled order backwards.
     """
+    allowed = {"created", "authorized", "partially_captured", "captured", "paid", "failed"}
+    if status not in allowed:
+        raise ValueError(f"unsupported order status: {status!r}")
+    if captured_amount_paise is not None:
+        if type(captured_amount_paise) is not int or captured_amount_paise <= 0:
+            raise ValueError("captured_amount_paise must be a positive integer")
+    if payment_id is not None and (not isinstance(payment_id, str) or not payment_id):
+        raise ValueError("payment_id must be a non-empty string")
+
     db_path = db_path or ORDERS_DB
     conn = _connect(db_path)
     try:
-        cursor = conn.execute(
-            "UPDATE orders SET status = ? WHERE order_id = ?", (status, order_id)
-        )
-        if cursor.rowcount == 0:
-            raise OrderNotFoundError(f"no order on file for order_id={order_id}")
+        conn.execute("BEGIN IMMEDIATE")
         row = _select_by_order_id(conn, order_id)
+        if row is None:
+            conn.execute("ROLLBACK")
+            raise OrderNotFoundError(f"no order on file for order_id={order_id}")
+        existing = _row_to_order(row, from_cache=True)
+
+        requested_capture = captured_amount_paise
+        if status in {"captured", "paid"} and requested_capture is None:
+            requested_capture = existing.amount_paise
+        if requested_capture is not None and requested_capture > existing.amount_paise:
+            conn.execute("ROLLBACK")
+            raise AmountMismatchError(
+                existing.quote_id, requested_capture, existing.amount_paise
+            )
+
+        next_capture = max(existing.captured_amount_paise, requested_capture or 0)
+        requested_status = status
+        if status == "captured" and next_capture < existing.amount_paise:
+            requested_status = "partially_captured"
+
+        settled = existing.status in {"partially_captured", "captured", "paid"}
+        full_settlement = existing.status in {"captured", "paid"}
+        if status in {"failed", "authorized", "created"} and settled:
+            next_status = existing.status
+            next_payment_id = existing.payment_id
+        elif full_settlement and requested_status == "partially_captured":
+            next_status = existing.status
+            next_payment_id = existing.payment_id
+        elif existing.status == "paid" and requested_status == "captured":
+            next_status = "paid"
+            next_payment_id = existing.payment_id or payment_id
+        else:
+            next_status = requested_status
+            next_payment_id = payment_id or existing.payment_id
+
+        conn.execute(
+            "UPDATE orders SET status = ?, captured_amount_paise = ?, payment_id = ? "
+            "WHERE order_id = ?",
+            (next_status, next_capture, next_payment_id, order_id),
+        )
+        row = _select_by_order_id(conn, order_id)
+        conn.execute("COMMIT")
         return _row_to_order(row, from_cache=True)
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
