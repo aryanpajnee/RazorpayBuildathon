@@ -551,6 +551,32 @@ def _tool_call(name: str, args: dict[str, Any], call_id: str) -> dict[str, Any]:
     return {"name": name, "args": args, "id": call_id}
 
 
+def local_shelf_script(request: str) -> ScriptedModel:
+    """A network-free planner for the explicitly simulated UI mode.
+
+    The request supplies the search query and ``fake_search`` chooses the
+    matching shelf, so this plan cannot replay the old shoe-only demo for a
+    different product. Candidate identity is filled from the actual search
+    tool result before listing, and every price and payment decision still
+    comes from the merchant and Gate.
+    """
+    query = (request or "").strip()
+    return ScriptedModel(
+        turns=[
+            [_tool_call("web_search", {"query": query}, "local_search")],
+            [
+                _tool_call(
+                    "list_with_merchant",
+                    {"candidate_id": "$candidate_1"},
+                    "local_list",
+                )
+            ],
+            [_tool_call("sign_and_submit", {}, "local_submit")],
+            "The simulated buyer completed its bounded plan.",
+        ]
+    )
+
+
 def happy_path_script() -> ScriptedModel:
     """The clean buy: search -> list the cheap in-budget find -> sign & submit
     (passes the Gate first try) -> finish.

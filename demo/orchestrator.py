@@ -173,11 +173,10 @@ def run_streamed(
 def _offline_kwargs(request: str) -> dict:
     """What makes a run "Simulated": a fixed candidate shelf and a fake gateway.
 
-    Nothing else. The model is deliberately absent from this dict, so
-    `demo.agent.run` builds the CONFIGURED one and the buyer genuinely reasons —
-    it chooses its own search query and its own product, it just never touches
-    the live web or a real gateway. That is the honest reading of "simulated",
-    and the only one that matches what the UI tells the user.
+    The local planner follows the request through the matching fixture shelf,
+    so this mode remains usable when hosted model accounts are unavailable or
+    rate-limited. It is deliberately limited to the UI's labelled simulated
+    lane; live mode still uses the configured model and real search providers.
 
     Three things this function must never do again:
 
@@ -186,14 +185,8 @@ def _offline_kwargs(request: str) -> dict:
       the run's signed consent, which `run_streamed` layers over this dict; the
       derivation below is only for direct, consent-free callers (tests, proof
       scripts), and it reads the request rather than ignoring it.
-    * Script the model. A `ScriptedModel` here replays a pre-written purchase and
-      presents it as the agent's judgement — the exact fake the project's rules
-      forbid, and the second half of the coffee-machine-buys-sneakers bug.
-    * Fall back to either of those when the model is unavailable. If the model
-      cannot be built or a turn fails, `demo.agent.run` ends the run with an
-      honest status (`no_model` / `stopped`) that the event stream surfaces. A
-      run that visibly fails is a working demo of an honest system; a run that
-      quietly substitutes a canned purchase is a broken one that looks fine.
+    * Reuse a product-specific plan. The local plan takes this request as its
+      query and binds only a candidate returned by the matching shelf.
 
     `consent_category` is the same deterministic, network-free derivation the
     consent step uses, so a direct caller gets the label the user would have been
@@ -207,6 +200,7 @@ def _offline_kwargs(request: str) -> dict:
         "category": consent_category(request),
         "search_fn": fixtures.fake_search,
         "gateway": FakeGateway(),
+        "model": fixtures.local_shelf_script(request),
     }
 
 

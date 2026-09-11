@@ -184,6 +184,35 @@ def test_generic_model_error_is_reported_not_over_claimed():
     assert "ConnectionError" in res.reason
 
 
+def test_bound_buyer_model_uses_configured_fallback_after_provider_rejects_turn(monkeypatch):
+    """The real buyer binds tools directly, so it must retain the configured
+    provider fallback instead of stopping when the primary rejects tool JSON."""
+    from buyer import llm
+
+    primary = _RaisingModel(RuntimeError("OpenAIInvalidRequestError: rejected tool call"))
+    fallback = fixtures.happy_path_script()
+
+    def fake_model_factory(**kwargs):
+        return fallback if kwargs.get("api_key") == "fallback-key" else primary
+
+    monkeypatch.setattr(llm, "get_chat_model", fake_model_factory)
+    monkeypatch.setattr(llm, "fallback_target", lambda: ("gemini", "fallback-key"))
+
+    gateway = FakeGateway()
+    result = agent.run(
+        "running shoes",
+        4000,
+        category="footwear",
+        search_fn=fixtures.fake_search,
+        gateway=gateway,
+    )
+
+    assert result.status == "ordered"
+    assert result.order_id is not None
+    assert gateway.calls == 1
+    assert result.llm_calls == 4  # one rejected primary call + three fallback turns
+
+
 def test_all_macbook_options_over_15000_get_an_explicit_budget_refusal():
     """Regression: a vague model finish must not hide the obvious budget fact."""
     macbooks = [

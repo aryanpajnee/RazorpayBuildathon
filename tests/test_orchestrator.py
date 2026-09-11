@@ -265,16 +265,18 @@ def test_offline_kwargs_derives_the_category_from_the_request():
     assert other["category"] != kwargs["category"]
 
 
-def test_offline_kwargs_ships_no_scripted_model():
-    """No `model` key: `demo.agent.run` builds the configured one and the buyer
-    genuinely reasons. A script here would replay a pre-written purchase and
-    present it as the agent's judgement."""
+def test_offline_kwargs_uses_a_request_aware_network_free_planner():
+    """Simulated purchases must remain available without model-provider quota,
+    while still searching for the product the user actually requested."""
     kwargs = orchestrator._offline_kwargs("a coffee machine for my kitchen")
 
-    assert "model" not in kwargs
+    assert isinstance(kwargs["model"], fixtures.ScriptedModel)
     assert kwargs["search_fn"] is fixtures.fake_search
     # Simulated checkout stays eligible only because of this exact marker.
     assert getattr(kwargs["search_fn"], "__vera_candidate_authority__", None) == "trusted_demo"
+
+    first = kwargs["model"].invoke([])
+    assert first.tool_calls[0]["args"]["query"] == "a coffee machine for my kitchen"
 
 
 def test_a_coffee_machine_request_buys_a_coffee_machine():
@@ -321,10 +323,9 @@ def test_an_unstocked_request_ends_honestly_rather_than_buying_something_else():
     assert events[-1]["order_id"] is None
 
 
-def test_an_unavailable_model_fails_the_run_instead_of_replaying_a_script(monkeypatch):
-    """The failure mode the old default hid. With no script to fall back on, a
-    model that cannot be built must end the run with a surfaced, honest status —
-    never a canned purchase that looks like success."""
+def test_live_mode_with_an_unavailable_model_fails_closed(monkeypatch):
+    """Live mode must surface provider failure and never borrow the simulated
+    planner to make a purchase that looks live."""
     import buyer.llm as buyer_llm
 
     def _no_model(*args, **kwargs):
@@ -333,7 +334,7 @@ def test_an_unavailable_model_fails_the_run_instead_of_replaying_a_script(monkey
     monkeypatch.setattr(buyer_llm, "get_chat_model", _no_model)
 
     events = list(orchestrator.run_streamed(
-        "a coffee machine for my kitchen", 20_000, mode="offline",
+        "a coffee machine for my kitchen", 20_000, mode="live",
     ))
 
     assert events[-1]["type"] == "run_complete"

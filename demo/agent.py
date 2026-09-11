@@ -366,6 +366,7 @@ def run(
     # 3. Build the tools and bind them to the model.
     tools = build_tools(context)
     tools_by_name = {t.name: t for t in tools}
+    model_was_injected = model is not None
     if model is None:
         # Route the model build through AGENT_LLM_PURPOSE so the buyer loop's
         # provider choice is explicit and a future fast-lane purpose can never
@@ -382,6 +383,7 @@ def run(
                 transcript=transcript,
             )
     model_with_tools = model.bind_tools(tools)
+    fallback_attempted = False
 
     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
@@ -422,14 +424,40 @@ def run(
             # order exists. Ending the run here can only ever UNDER-buy; it can
             # never fabricate a purchase. We record it and fall through to the
             # honest status derivation below.
-            model_error = exc
+            # The buyer's bound-tool path cannot use LLMGateway.invoke directly,
+            # because binding produces a provider-specific runnable. Give a
+            # configured fallback provider one chance here as well. This is
+            # especially useful when an OpenAI-compatible provider rejects its
+            # own generated tool JSON: no tool ran, so replaying the same turn
+            # on the fallback cannot duplicate an order or weaken the Gate.
             llm_calls += 1
-            turns += 1
-            _event(transcript, "thought",
-                   text="Vera could not finalise a valid next action, so it stopped "
-                        "without ordering — nothing was bought.",
-                   on_event=on_event)
-            break
+            if not model_was_injected and not fallback_attempted:
+                fallback_attempted = True
+                try:
+                    from buyer.llm import fallback_target
+
+                    target = fallback_target()
+                    if target is None:
+                        raise exc
+                    provider, api_key = target
+                    fallback_model = get_chat_model(provider=provider, api_key=api_key)
+                    model_with_tools = fallback_model.bind_tools(tools)
+                    ai = model_with_tools.invoke(messages)
+                except Exception as fallback_exc:  # noqa: BLE001 — handled below
+                    llm_calls += 1
+                    model_error = fallback_exc
+                else:
+                    model_error = None
+            else:
+                model_error = exc
+
+            if model_error is not None:
+                turns += 1
+                _event(transcript, "thought",
+                       text="Vera could not finalise a valid next action, so it stopped "
+                            "without ordering — nothing was bought.",
+                       on_event=on_event)
+                break
         llm_calls += 1
         turns += 1
         messages.append(ai)
