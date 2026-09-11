@@ -85,7 +85,7 @@ import config
 # copies of a rupee/paise parser WILL drift, and the drift shows up as a
 # hundred-fold price error rather than a crash. If it later moves to a shared
 # money module, only this line changes.
-from demo.search import parse_price_to_paise
+from demo.search import parse_prices_to_paise
 from merchant import candidate_store
 
 # Authority labels this module can mint. `advisory` and `trusted_demo` are
@@ -392,6 +392,7 @@ def _capture_derived(
     authority: str,
     evidence_kind: str,
     db_path: Path | None,
+    url: str | None = None,
 ) -> candidate_store.Candidate:
     """Capture the derived row, copying the observed row's product identity.
 
@@ -406,7 +407,7 @@ def _capture_derived(
         intent_mandate_id=candidate.intent_mandate_id,
         query=candidate.query,
         title=candidate.title,
-        url=candidate.url,
+        url=url or candidate.url,
         seller=candidate.seller,
         price_paise=price_paise,
         price_display=price_display,
@@ -418,6 +419,51 @@ def _capture_derived(
         parent_candidate_id=candidate.candidate_id,
         db_path=db_path,
     )
+
+
+def _resolve_shopping_url(candidate: candidate_store.Candidate) -> str:
+    """Resolve Serper's Google Shopping wrapper to the retailer product page.
+
+    Shopping results expose a structured price but often return a google.com
+    wrapper that the merchant cannot verify. A separate organic lookup finds a
+    public retailer URL; that URL is still fetched and price-checked below, so
+    resolution grants no price authority by itself.
+    """
+    try:
+        host = (urlsplit(candidate.url).hostname or "").lower()
+    except ValueError:
+        return candidate.url
+    if candidate.source != "serper" or not host.endswith("google.com"):
+        return candidate.url
+    if not config.SERPER_API_KEY:
+        return candidate.url
+
+    seller = (candidate.seller or "").strip().lower().replace(" ", "")
+    site = seller if "." in seller else ""
+    title_words = candidate.title.split()[:14]
+    query = " ".join(title_words)
+    if site:
+        query = f"{query} site:{site}"
+    try:
+        response = httpx.post(
+            config.SERPER_SEARCH_ENDPOINT,
+            headers={"X-API-KEY": config.SERPER_API_KEY, "Content-Type": "application/json"},
+            json={"q": query, "gl": config.SEARCH_REGION, "hl": config.SEARCH_LANG},
+            timeout=_setting("VERIFIER_TIMEOUT_SECONDS"),
+        )
+        response.raise_for_status()
+        for result in response.json().get("organic", []):
+            url = (result.get("link") or "").strip()
+            if not url or not url_is_fetchable(url):
+                continue
+            resolved_host = (urlsplit(url).hostname or "").lower()
+            if site and not (resolved_host == site or resolved_host.endswith(f".{site}")):
+                continue
+            if any(marker in urlsplit(url).path.lower() for marker in ("/dp/", "/product/", "/products/", "/p-", "/p/")):
+                return url
+    except Exception:  # noqa: BLE001 — ordinary resolution failure; original URL fails closed
+        return candidate.url
+    return candidate.url
 
 
 def verify_candidate(
@@ -488,22 +534,23 @@ def verify_candidate(
         # and enforces this too; this is the same refusal, taken early.
         _check_agreement(0, None)
 
-    if not url_is_fetchable(candidate.url):
+    verification_url = _resolve_shopping_url(candidate)
+    if not url_is_fetchable(verification_url):
         # Refused before any socket is opened for the fetch. Not corroboration-
         # eligible: a URL the merchant will not open is not a URL it will list.
         raise VerificationError(
-            f"refusing to open {candidate.url}: only public http(s) product pages "
+            f"refusing to open {verification_url}: only public http(s) product pages "
             f"can be verified. Pick a candidate with a normal shopping URL.",
             code="unfetchable_url",
         )
 
     try:
-        page_text = fetch(candidate.url)
+        page_text = fetch(verification_url)
     except Exception as exc:  # noqa: BLE001 — any fetch failure is a refusal, not a crash
         return _corroborate(
             candidate,
             VerificationError(
-                f"could not open {candidate.url} to verify its price "
+                f"could not open {verification_url} to verify its price "
                 f"({type(exc).__name__}); the retailer may be blocking automated "
                 f"requests. Pick a different candidate.",
                 code="page_unreachable",
@@ -512,8 +559,8 @@ def verify_candidate(
             db_path=db_path,
         )
 
-    page_paise, page_display = parse_price_to_paise(page_text)
-    if page_paise is None:
+    page_prices = parse_prices_to_paise(page_text)
+    if not page_prices:
         return _corroborate(
             candidate,
             VerificationError(
@@ -524,6 +571,12 @@ def verify_candidate(
             allow_corroboration=allow_corroboration,
             db_path=db_path,
         )
+    # Retail pages routinely put coupon amounts and unrelated recommendations
+    # before the product's price. Choose the explicit page price closest to the
+    # structured listing, then apply the same strict tolerance check below.
+    page_paise, page_display = min(
+        page_prices, key=lambda parsed: abs(parsed[0] - observed)
+    )
     if type(page_paise) is not int or page_paise <= 0:
         raise VerificationError(
             f"page price is not a usable paise value ({page_paise!r})",
@@ -539,6 +592,7 @@ def verify_candidate(
         authority=VERIFIED_AUTHORITY,
         evidence_kind="merchant_page_fetch",
         db_path=db_path,
+        url=verification_url,
     )
     return Verification(
         candidate_id=row.candidate_id,

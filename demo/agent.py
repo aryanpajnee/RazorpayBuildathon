@@ -32,6 +32,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Callable
+from urllib.parse import urlsplit
 
 import config
 from demo.tools import ToolContext, build_tools, grant_fixture_intent
@@ -385,6 +386,27 @@ def run(
     model_with_tools = model.bind_tools(tools)
     fallback_attempted = False
 
+    def _execute_tool(name: str, args: dict) -> str:
+        """Execute one bounded action and emit the normal audit events."""
+        _event(transcript, "tool_call", name=name, args=args, on_event=on_event)
+        quote_id_before = context.last_quote_id
+        gate_result_before = context.last_gate_result
+        tool = tools_by_name.get(name)
+        if tool is None:
+            out = f"Unknown tool {name!r}. Available: {', '.join(tools_by_name)}."
+        else:
+            try:
+                out = tool.func(**args)
+            except TypeError as exc:
+                out = f"Bad arguments for {name}: {exc}"
+            except Exception as exc:  # noqa: BLE001 — a tool bug must not kill the loop
+                out = f"Tool {name} errored: {type(exc).__name__}: {exc}"
+        _event(transcript, "tool_result", name=name, result=out, on_event=on_event)
+        _emit_tool_side_effects(
+            on_event, context, name, args, quote_id_before, gate_result_before
+        )
+        return out
+
     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
     messages: list = [
@@ -475,29 +497,61 @@ def run(
             name = call.get("name")
             args = call.get("args") or {}
             call_id = call.get("id") or name
-            _event(transcript, "tool_call", name=name, args=args, on_event=on_event)
-            # Snapshot BEFORE the tool runs, so a failed call (which leaves these
-            # context fields untouched) can never be mistaken for a fresh quote
-            # or a fresh Gate decision when _emit_tool_side_effects looks after.
-            quote_id_before = context.last_quote_id
-            gate_result_before = context.last_gate_result
-            tool = tools_by_name.get(name)
-            if tool is None:
-                out = f"Unknown tool {name!r}. Available: {', '.join(tools_by_name)}."
-            else:
-                try:
-                    out = tool.func(**args)
-                except TypeError as exc:
-                    out = f"Bad arguments for {name}: {exc}"
-                except Exception as exc:  # noqa: BLE001 — a tool bug must not kill the loop
-                    out = f"Tool {name} errored: {type(exc).__name__}: {exc}"
-            _event(transcript, "tool_result", name=name, result=out, on_event=on_event)
-            _emit_tool_side_effects(on_event, context, name, args, quote_id_before, gate_result_before)
+            out = _execute_tool(name, args)
             messages.append(ToolMessage(content=out, tool_call_id=call_id))
             if context.finished or context.order is not None:
                 # Do not execute later calls from the same model batch after a
                 # purchase or an ambiguous gateway outcome ends the run.
                 break
+
+    # A live model can burn its budget rewording searches or become rate-limited
+    # after it understood the request. Before returning a useless step-cap
+    # screen, run one narrow recovery over live product pages. Candidate choice
+    # is deterministic here; price authority is not: the merchant still fetches
+    # the page and derives the quote, and the Gate still decides whether it may
+    # become an order.
+    recovery_needed = (
+        not model_was_injected
+        and context.order is None
+        and (model_error is not None or hit_llm_budget or turns >= step_cap)
+    )
+    if recovery_needed:
+        _event(
+            transcript,
+            "thought",
+            text="The model stopped making progress. Vera is trying a bounded "
+                 "recovery with verified product pages under the signed cap.",
+            on_event=on_event,
+        )
+        _execute_tool(
+            "web_search",
+            {"query": f"{request} under ₹{budget_rupees}"},
+        )
+        # Leave room for GST and any merchant-side additions. This is candidate
+        # ranking only; the signed budget is still enforced exclusively by Gate.
+        safe_listing_limit = budget_paise * 80 // 100
+        candidates = sorted(
+            (
+                candidate
+                for candidate in (context.last_candidates or [])
+                if type(candidate.get("price_paise")) is int
+                and 0 < candidate["price_paise"] <= safe_listing_limit
+                and (
+                    _looks_like_product_page(candidate.get("url"))
+                    or candidate.get("source") == "serper"
+                )
+            ),
+            key=lambda candidate: candidate["price_paise"],
+        )
+        for candidate in candidates[:3]:
+            _execute_tool(
+                "list_with_merchant", {"candidate_id": candidate["candidate_id"]}
+            )
+            if context.last_quote_id:
+                _execute_tool("sign_and_submit", {})
+                if context.order is not None:
+                    model_error = None
+                    break
 
     # Search prices are advisory rather than authoritative, but when every priced
     # result is already above the signed ceiling we can state that no-buy reason
@@ -643,6 +697,20 @@ def _exact_match_unavailable_reason(
         f"requested product ({requested_name}). The budget was not the issue, "
         "and substitutions were not allowed. Nothing was ordered."
     )
+
+
+def _looks_like_product_page(url: object) -> bool:
+    """Reject articles, search pages, and category shelves during automatic
+    recovery. The model may read them, but Vera must never buy a blog post."""
+    if not isinstance(url, str):
+        return False
+    try:
+        path = urlsplit(url).path.lower()
+    except ValueError:
+        return False
+    if any(part in path for part in ("/blog", "/search", "/collections/", "/category/")):
+        return False
+    return any(part in path for part in ("/dp/", "/product/", "/products/", "/p-", "/p/"))
 
 
 _MALFORMED_TOOL_CALL_MARKERS = (

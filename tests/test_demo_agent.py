@@ -213,6 +213,39 @@ def test_bound_buyer_model_uses_configured_fallback_after_provider_rejects_turn(
     assert result.llm_calls == 4  # one rejected primary call + three fallback turns
 
 
+def test_live_step_cap_recovers_to_a_verified_under_cap_candidate(monkeypatch):
+    """A model that only searches must not strand the run at the step cap.
+    The bounded controller advances one request-matching candidate through the
+    merchant and Gate using the same audited tools."""
+    from buyer import llm
+
+    searching_model = fixtures.ScriptedModel(
+        turns=[
+            [{"name": "web_search", "args": {"query": "coffee machine"}, "id": "s1"}],
+            [{"name": "web_search", "args": {"query": "coffee maker"}, "id": "s2"}],
+        ]
+    )
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: searching_model)
+
+    gateway = FakeGateway()
+    result = agent.run(
+        "coffee machine",
+        20_000,
+        category="coffee machine",
+        search_fn=fixtures.fake_search,
+        gateway=gateway,
+        max_steps=2,
+    )
+
+    assert result.status == "ordered"
+    assert result.order_id is not None
+    assert gateway.calls == 1
+    assert any(
+        entry.get("kind") == "thought" and "bounded recovery" in entry.get("text", "")
+        for entry in result.transcript
+    )
+
+
 def test_all_macbook_options_over_15000_get_an_explicit_budget_refusal():
     """Regression: a vague model finish must not hide the obvious budget fact."""
     macbooks = [

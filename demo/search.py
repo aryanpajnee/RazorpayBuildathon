@@ -95,25 +95,35 @@ def parse_price_to_paise(text: str | None) -> tuple[int | None, str | None]:
     path (2499.50 * 100) is not guaranteed exact and has no business anywhere
     near a money value, reasoning-only or not.
     """
+    prices = parse_prices_to_paise(text)
+    return prices[0] if prices else (None, None)
+
+
+def parse_prices_to_paise(text: str | None) -> list[tuple[int, str]]:
+    """Return every explicit rupee price in source order.
+
+    Product pages contain banners, coupons, variants, and the actual product
+    price. Discovery keeps using the first value; the merchant verifier uses
+    the complete list to find the value that agrees with the independently
+    observed listing instead of mistaking a ₹4 promotion for the product.
+    """
     if not text:
-        return None, None
-    m = _PRICE_RE.search(text)
-    if not m:
-        return None, None
-    # A minus in front of the currency marker ("-₹500", "- ₹500") is a discount
-    # or a malformed value, never a product price — reject it. (The captured
-    # digits are always unsigned, so the sign has to be checked here.)
-    if text[: m.start()].rstrip().endswith("-"):
-        return None, None
-    raw = m.group(1).replace(",", "")
-    try:
-        rupees = Decimal(raw)
-    except InvalidOperation:
-        return None, None
-    if rupees < 0:
-        return None, None
-    paise = int((rupees * 100).to_integral_value())
-    return paise, m.group(0).strip()
+        return []
+    prices: list[tuple[int, str]] = []
+    for match in _PRICE_RE.finditer(text):
+        if text[: match.start()].rstrip().endswith("-"):
+            continue
+        raw = match.group(1).replace(",", "")
+        try:
+            rupees = Decimal(raw)
+        except InvalidOperation:
+            continue
+        if rupees < 0:
+            continue
+        prices.append(
+            (int((rupees * 100).to_integral_value()), match.group(0).strip())
+        )
+    return prices
 
 
 # --------------------------------------------------------------------------- #
@@ -141,7 +151,7 @@ def _tavily(query: str, limit: int) -> list[SearchResult]:
     for r in resp.json().get("results", []):
         url = (r.get("url") or "").strip()
         title = (r.get("title") or "").strip()
-        if not url or not title:
+        if not url or not title or _domain(url) in {"youtube.com", "youtu.be"}:
             continue
         content = r.get("content") or ""
         # Tavily has no price field; read one out of title+content if present.
@@ -157,6 +167,9 @@ def _tavily(query: str, limit: int) -> list[SearchResult]:
                 snippet=content[:300].strip(),
             )
         )
+    # A priced product page is actionable; an unpriced category page is still
+    # useful discovery but should not crowd it out of the model's short list.
+    out.sort(key=lambda result: result.price_paise is None)
     return out
 
 
@@ -267,6 +280,16 @@ def web_search(query: str, *, max_results: int | None = None) -> list[SearchResu
             log.warning("search: provider %s failed (%s: %s) — falling through",
                         name, type(exc).__name__, exc)
             continue
+        # Tavily sometimes answers a shopping query with unpriced category
+        # pages or even unrelated search shelves. Keep falling through to the
+        # structured shopping provider unless at least one priced product page
+        # is actionable by the merchant verifier.
+        if name == "tavily" and results and not any(
+            result.price_paise is not None and _looks_like_product_url(result.url)
+            for result in results
+        ):
+            log.info("search: tavily returned discovery pages but no priced product page")
+            continue
         if results:
             log.info("search: %s returned %d result(s) for %r", name, len(results), query)
             return results[:limit]
@@ -274,6 +297,16 @@ def web_search(query: str, *, max_results: int | None = None) -> list[SearchResu
 
     log.info("search: all providers returned nothing for %r", query)
     return []
+
+
+def _looks_like_product_url(url: str) -> bool:
+    try:
+        path = urlsplit(url).path.lower()
+    except ValueError:
+        return False
+    if any(marker in path for marker in ("/blog", "/search", "/collections/", "/category/")):
+        return False
+    return any(marker in path for marker in ("/dp/", "/product/", "/products/", "/p-", "/p/"))
 
 
 # --------------------------------------------------------------------------- #

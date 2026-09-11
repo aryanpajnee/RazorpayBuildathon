@@ -170,7 +170,7 @@ LLM_RETRY_BACKOFF_BASE_SECONDS = 1.0
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
 
-SEARCH_PROVIDER_ORDER = ("serper", "tavily", "duckduckgo")
+SEARCH_PROVIDER_ORDER = ("tavily", "serper", "duckduckgo")
 SEARCH_MAX_RESULTS = 8               # cap results handed to the agent per query
 SEARCH_TIMEOUT_SECONDS = 8.0         # per-provider HTTP timeout; on hit -> next provider
 SEARCH_REGION = "in"                 # Serper gl= : bias results to India
@@ -178,6 +178,7 @@ SEARCH_LANG = "en"                   # Serper hl=
 
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 SERPER_SHOPPING_ENDPOINT = "https://google.serper.dev/shopping"
+SERPER_SEARCH_ENDPOINT = "https://google.serper.dev/search"
 DUCKDUCKGO_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
 
 # --- Razorpay --------------------------------------------------------------

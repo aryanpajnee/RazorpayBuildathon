@@ -50,13 +50,14 @@ def _advisory(
     price_paise: int | None = 849_900,
     source: str = "serper",
     title: str = "Wonderchef Regenta 19 bar Espresso Coffee Machine",
+    seller: str = "ExampleMart",
 ) -> candidate_store.Candidate:
     return candidate_store.capture(
         intent_mandate_id=INTENT,
         query="coffee machine",
         title=title,
         url=url,
-        seller="ExampleMart",
+        seller=seller,
         price_paise=price_paise,
         price_display="₹8,499" if price_paise else None,
         source=source,
@@ -165,22 +166,51 @@ def test_a_candidate_with_no_listed_price_cannot_be_verified(monkeypatch):
     _assert_not_quotable(observed)
 
 
-def test_a_banner_price_far_from_the_listing_is_refused(monkeypatch):
-    """The concrete failure mode the band exists for: the page parse takes the
-    first currency-marked number on the page, which on a real storefront is
-    routinely a promo banner rather than this product's price."""
+def test_a_banner_price_does_not_hide_the_matching_product_price(monkeypatch):
+    """A promotion may precede the actual product price in the page source.
+    Verification selects the bounded matching value rather than the banner."""
     _public_dns(monkeypatch)
     observed = _advisory(price_paise=849_900)
 
-    with pytest.raises(verifier.VerificationError) as exc:
-        verifier.verify_candidate(
-            observed.candidate_id,
-            intent_mandate_id=INTENT,
-            fetcher=lambda url: "<html>Flat ₹15 off over Rs.1500 — Espresso Machine ₹8,499</html>",
-        )
+    result = verifier.verify_candidate(
+        observed.candidate_id,
+        intent_mandate_id=INTENT,
+        fetcher=lambda url: "<html>Flat ₹15 off over Rs.1500 — Espresso Machine ₹8,499</html>",
+    )
 
-    assert exc.value.code == "price_disagreement"
-    _assert_not_quotable(observed)
+    assert result.price_paise == 849_900
+    assert result.authority == verifier.VERIFIED_AUTHORITY
+
+
+def test_serper_shopping_wrapper_resolves_to_retailer_product_page(monkeypatch):
+    """Google Shopping wrapper links must not strand the live buying flow."""
+    _public_dns(monkeypatch)
+    monkeypatch.setattr(config, "SERPER_API_KEY", "test-key")
+    observed = _advisory(
+        url="https://www.google.com/search?ibp=oshop&q=coffee+machine",
+        seller="example-shop.test",
+    )
+    resolved = "https://example-shop.test/products/coffee-machine"
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"organic": [{"link": resolved}]}
+
+    monkeypatch.setattr(verifier.httpx, "post", lambda *a, **k: _Response())
+    fetched: list[str] = []
+
+    result = verifier.verify_candidate(
+        observed.candidate_id,
+        intent_mandate_id=INTENT,
+        fetcher=lambda url: fetched.append(url) or PAGE,
+    )
+
+    assert fetched == [resolved]
+    assert result.url == resolved
+    assert candidate_store.get(result.candidate_id).url == resolved
 
 
 def test_the_verified_row_keeps_the_search_snippet_not_the_page_text(monkeypatch):
