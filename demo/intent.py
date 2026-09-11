@@ -53,11 +53,19 @@ _STOP = {
 }
 _PRICE_RE = re.compile(r"(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?k?", re.IGNORECASE)
 
-# Prepositions that introduce a purpose/qualifier clause rather than more of the
-# product name: "a coffee machine FOR my kitchen", "shoes UNDER 3000". Matched on
-# word boundaries so "formal" is not mistaken for "for".
+# Where the product name stops and a purpose/qualifier clause starts: "a coffee
+# machine FOR my kitchen", "shoes UNDER 3000", "an espresso machine, EXACT
+# PRODUCT ONLY". Punctuation counts too — a comma or dash almost always opens an
+# aside rather than continuing the product name.
+#
+# Bare "to" is deliberately NOT in this list even though "up to" is. Hyphens are
+# word boundaries, so `\bto\b` fires inside "bean-to-cup espresso machine" and
+# amputates the scope to "bean-" — a label that matches no product on earth and
+# turns every candidate into a scope refusal. "up to" is matched as a unit
+# instead, which is the only form that actually introduces a price clause.
 _PURPOSE_RE = re.compile(
-    r"\b(?:for|to|with|without|under|below|above|over|around|about|upto|up\s+to|"
+    r"[,;:]|\s[-–—]\s|"
+    r"\b(?:for|with|without|under|below|above|over|around|about|upto|up\s+to|"
     r"that|which|so)\b",
     re.IGNORECASE,
 )

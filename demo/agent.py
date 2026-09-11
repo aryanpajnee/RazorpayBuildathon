@@ -35,7 +35,7 @@ from typing import Callable
 
 import config
 from demo.tools import ToolContext, build_tools, grant_fixture_intent
-from merchant import offers
+from merchant import candidate_store, offers
 
 SYSTEM_PROMPT = """You are an autonomous shopping agent buying ONE item for a user.
 
@@ -55,6 +55,10 @@ Work in this order, using ONLY your tools:
 5. If the Gate PASSES, call finish. If it REFUSES (e.g. OVER_LIMIT), call
    explain_refusal, then search for something cheaper and try again.
 6. If nothing fits under budget after a few tries, call finish and say so honestly.
+
+If two searches in a row come back with no candidates at all, stop searching:
+call finish and say plainly that nothing matching the request was found. Rewording
+the same query again will not find stock that is not there.
 
 Never claim an order was placed unless a sign_and_submit result said GATE PASS.
 Call one or a few tools per step. Be decisive."""
@@ -158,23 +162,40 @@ def _emit_product_chosen(on_event: "Callable[..., None] | None", context, args: 
     """Emit the display-only `product_chosen` fact: which item the buyer listed
     with the merchant, for the UI's product link/receipt.
 
-    Prefers the matching REAL search candidate (`context.last_candidates`, the
-    structured web data the search tool captured) over the model's echoed tool
-    args -- matched by url first, then by exact title -- so the link points at
-    the authoritative listing even if the model truncated the url. Falls back to
-    the model's own args when nothing matches. This is presentation only; the
-    enforced total is the merchant's re-derived quote, never anything here.
+    Resolves the candidate id through the SERVER's candidate store first, and
+    only then through `context.last_candidates`.
+
+    The store is the authority here for a practical reason, not a purity one:
+    `last_candidates` holds one search's results and is overwritten on every
+    `web_search` call. A real model routinely searches twice and then lists
+    something it saw in the first search -- at which point the id is no longer
+    in `last_candidates` and the UI renders "Unknown item" with an empty link
+    for a product that was bought perfectly correctly. That could not happen
+    back when a one-search script drove every demo run, which is why it went
+    unnoticed. The store still has the row.
+
+    Display only. The enforced total is the merchant's re-derived quote and the
+    checkout binding is the server-side candidate row; nothing here is read back
+    into a money decision.
     """
     if on_event is None:
         return
     candidate_id = args.get("candidate_id") if isinstance(args.get("candidate_id"), str) else ""
 
-    candidates = context.last_candidates or []
-    match = next(
-        (c for c in candidates if candidate_id and c.get("candidate_id") == candidate_id),
-        None,
-    )
-    match = match or {}
+    match = {}
+    if candidate_id:
+        try:
+            stored = candidate_store.get(candidate_id)
+        except Exception:  # noqa: BLE001 — a display lookup must never kill a run
+            stored = None
+        if stored is not None:
+            match = stored.as_display_dict()
+    if not match:
+        candidates = context.last_candidates or []
+        match = next(
+            (c for c in candidates if candidate_id and c.get("candidate_id") == candidate_id),
+            None,
+        ) or {}
 
     _emit_event(
         on_event,
