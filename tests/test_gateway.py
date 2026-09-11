@@ -100,6 +100,18 @@ def test_calling_create_order_twice_with_the_same_quote_id_returns_the_same_orde
     assert second.from_cache is True
 
 
+def test_separate_default_fake_gateways_create_distinct_order_ids(tmp_path):
+    """The UI constructs a fresh fake gateway for each offline run. Its ids
+    must therefore be unique across instances, not just within one object."""
+    db = tmp_path / "orders.db"
+    first = create_order("quote_first", 100000, gateway=FakeGateway(), db_path=db)
+    second = create_order("quote_second", 100000, gateway=FakeGateway(), db_path=db)
+
+    assert first.order_id != second.order_id
+    assert find_by_order_id(first.order_id, db_path=db).quote_id == "quote_first"
+    assert find_by_order_id(second.order_id, db_path=db).quote_id == "quote_second"
+
+
 def test_a_second_call_for_the_same_quote_id_never_hits_the_gateway_again(tmp_path):
     db = tmp_path / "orders.db"
     gw = FakeGateway()

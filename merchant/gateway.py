@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -257,10 +258,9 @@ def _require_amount(amount_paise: object) -> int:
 class FakeGateway:
     """In-process stand-in for Razorpay. Used automatically whenever
     config.USE_FAKE_GATEWAY is True, and can be injected explicitly so tests
-    never depend on env state. Deterministic and sequential -- order ids are
-    assigned by an internal counter, not randomness -- so assertions on
-    exact ids are possible and `.calls` lets a test prove the gateway was
-    (or was not) hit a second time.
+    never depend on env state. Order ids remain unique even though the default
+    gateway object is short-lived and recreated for separate requests;
+    `.calls` still lets an injected test double prove whether it was hit twice.
     """
 
     gateway_name = GATEWAY_TEST_SIM
@@ -272,7 +272,7 @@ class FakeGateway:
     def create_order(self, amount_paise: int, currency: str, receipt: str, notes: dict) -> dict:
         self.calls += 1
         return {
-            "id": f"order_fake{self.calls:06d}",
+            "id": f"order_fake_{uuid.uuid4().hex}",
             "amount": amount_paise,
             "currency": currency,
             "receipt": receipt,

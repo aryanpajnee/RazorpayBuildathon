@@ -153,7 +153,12 @@ export default function ComposeStep({ draft, busy, error, onChange, onSubmit }: 
 
         {error ? <p className="field__error" role="alert">{error}</p> : null}
 
-        <button className="btn btn--primary btn--block" type="submit" disabled={busy}>
+        <button
+          className="btn btn--primary btn--block"
+          type="submit"
+          disabled={busy}
+          data-approval-invoker
+        >
           {busy ? "Preparing…" : "Review the terms"}
         </button>
         <p className="card__foot">You will see exactly what you are signing before anything runs.</p>

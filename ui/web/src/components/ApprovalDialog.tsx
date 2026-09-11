@@ -69,11 +69,14 @@ export default function ApprovalDialog({
   // Captured at mount rather than read at unmount: by the time this closes the
   // element may already have been re-rendered, and document.activeElement will
   // have moved to <body>.
-  const invokerRef = useRef<HTMLElement | null>(null);
+  // Capture during render, before the portal mounts. By the time an effect
+  // runs, the browser may already have moved focus to <body> while attaching
+  // the modal, which would make Escape lose the user's place.
+  const invokerRef = useRef<HTMLElement | null>(
+    typeof document === "undefined" ? null : (document.activeElement as HTMLElement | null),
+  );
 
   useEffect(() => {
-    invokerRef.current = document.activeElement as HTMLElement | null;
-
     const appRoot = document.getElementById("app-root");
     // `inert` removes the subtree from the tab order, from hit-testing and from
     // the accessibility tree in one go. aria-hidden is belt-and-braces for any
@@ -94,7 +97,11 @@ export default function ApprovalDialog({
       }
       // Restoring focus after the inert flag is cleared, otherwise the browser
       // refuses to focus a still-inert element and focus lands on <body>.
-      invokerRef.current?.focus?.();
+      const target =
+        invokerRef.current && invokerRef.current !== document.body
+          ? invokerRef.current
+          : document.querySelector<HTMLElement>("[data-approval-invoker]");
+      target?.focus();
     };
   }, []);
 
