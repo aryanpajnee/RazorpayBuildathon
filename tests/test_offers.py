@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 
 import config
-from merchant import catalog, offers
+from merchant import candidate_store, catalog, offers
 
 
 @pytest.fixture(autouse=True)
@@ -290,3 +290,98 @@ def test_registered_skus_is_sorted():
     skus = offers.registered_skus()
     assert skus == sorted(skus)
     assert o1.sku in skus and o2.sku in skus
+
+
+# --- provenance: the candidate's authority decides the offer's source ---------
+#
+# `source` is the permanent record of where an offer's price came from, and it
+# is the only thing downstream real-money checks read. It is derived from the
+# candidate row here and nowhere else, so a caller cannot name its own.
+
+_INTENT = "im_offer_provenance"
+
+
+@pytest.fixture(autouse=True)
+def _clean_candidates(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CANDIDATES_DB", tmp_path / "candidates.db")
+    candidate_store.clear()
+    yield
+
+
+def _candidate(authority: str, **extra):
+    return candidate_store.capture(
+        intent_mandate_id=_INTENT,
+        query="running shoes",
+        title="Provenance Trail Running Shoe",
+        url=f"https://example.com/provenance-{authority}",
+        seller="ExampleMart",
+        price_paise=249_900,
+        price_display="₹2,499",
+        source="serper",
+        snippet="ExampleMart · trail running shoe",
+        authority=authority,
+        **extra,
+    )
+
+
+@pytest.mark.parametrize(
+    "authority,expected_source,simulation_only",
+    [
+        (candidate_store.TRUSTED_DEMO, offers.SIMULATION_ONLY_SOURCE, True),
+        (candidate_store.CORROBORATED_EXTERNAL, offers.CORROBORATED_EXTERNAL_SOURCE, True),
+        (candidate_store.VERIFIED_EXTERNAL, offers.VERIFIED_EXTERNAL_SOURCE, False),
+    ],
+)
+def test_the_candidate_authority_decides_the_offer_source(
+    authority, expected_source, simulation_only
+):
+    parent = _candidate(candidate_store.ADVISORY)
+    candidate = (
+        _candidate(authority)
+        if authority == candidate_store.TRUSTED_DEMO
+        else _candidate(authority, parent_candidate_id=parent.candidate_id)
+    )
+    offer = offers.create_offer_from_candidate(
+        candidate_id=candidate.candidate_id,
+        intent_mandate_id=_INTENT,
+        intent_category="footwear",
+    )
+    assert offer.source == expected_source
+    assert offers.is_simulation_only(offer.source) is simulation_only
+    assert offers.sku_blocks_real_checkout(offer.sku) is simulation_only
+
+
+def test_an_advisory_candidate_is_not_listable_and_says_where_to_go():
+    """The refusal the whole verifier exists to let a candidate out of. It has
+    to name the route out, or a recovery agent is left guessing at a dead end."""
+    candidate = _candidate(candidate_store.ADVISORY)
+    with pytest.raises(offers.OfferError) as exc:
+        offers.create_offer_from_candidate(
+            candidate_id=candidate.candidate_id,
+            intent_mandate_id=_INTENT,
+            intent_category="footwear",
+        )
+    assert exc.value.code == "candidate_advisory"
+    assert "verify" in str(exc.value)
+    assert offers.registered_skus() == []
+
+
+def test_a_candidate_from_another_run_is_not_listable():
+    candidate = _candidate(candidate_store.TRUSTED_DEMO)
+    with pytest.raises(offers.OfferError) as exc:
+        offers.create_offer_from_candidate(
+            candidate_id=candidate.candidate_id,
+            intent_mandate_id="im_someone_else",
+            intent_category="footwear",
+        )
+    assert exc.value.code == "candidate_intent_mismatch"
+
+
+def test_a_merchant_owned_sku_never_blocks_real_checkout():
+    """`sku_blocks_real_checkout` is a provenance check, not a kill switch."""
+    assert offers.sku_blocks_real_checkout("NW-SHOE-001") is False
+
+
+def test_an_unresolvable_external_sku_blocks_real_checkout():
+    """Fails closed: no persisted row means no provenance to admit."""
+    assert offers.sku_blocks_real_checkout(config.OFFER_SKU_PREFIX + "GHOSTSKU") is True

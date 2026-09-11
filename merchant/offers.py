@@ -27,6 +27,17 @@ and no write to disk. This is a deliberate, load-bearing use of an
 implementation detail of a frozen module, not an accident to route around —
 see `_live_products()`.
 
+PROVENANCE. Relisting does not launder a price. Every offer carries a `source`
+recording where its number came from, derived here from the candidate's
+`authority` and never from anything the caller supplies: `merchant_catalog`
+(seed inventory), `verified_external` (merchant/verifier.py opened the product
+page and read the price itself), `corroborated_external` (the page could not be
+read; the provider's structured price field, simulation-only), and
+`trusted_demo_fixture` (an invented fixture price, simulation-only). A raw
+`advisory` search snippet is not listable at all. `sku_blocks_real_checkout`
+is the single predicate every real-money path asks about a relisted find, and
+it admits only the first two.
+
 Offers live in two places: immutable SQLite rows are authoritative and survive
 process restarts; the cached catalog append only makes new offers visible to
 search in the current process. Gate resolution uses the SQLite fallback by sku.
@@ -67,8 +78,29 @@ from merchant import candidate_store, catalog
 _REGISTERED: set[str] = set()
 
 # Provenance labels assigned by this module, not caller-controlled settings.
+# An offer's `source` is the permanent record of where its price came from, and
+# it is what every downstream "may this reach a real gateway?" check reads. It
+# is derived from the candidate's authority here and nowhere else, so a caller
+# cannot name its own provenance.
 SIMULATION_ONLY_SOURCE = "trusted_demo_fixture"
 MERCHANT_CATALOG_SOURCE = "merchant_catalog"
+VERIFIED_EXTERNAL_SOURCE = "verified_external"
+CORROBORATED_EXTERNAL_SOURCE = "corroborated_external"
+
+_AUTHORITY_TO_SOURCE = {
+    candidate_store.TRUSTED_DEMO: SIMULATION_ONLY_SOURCE,
+    candidate_store.CORROBORATED_EXTERNAL: CORROBORATED_EXTERNAL_SOURCE,
+    candidate_store.VERIFIED_EXTERNAL: VERIFIED_EXTERNAL_SOURCE,
+}
+
+# Prices nobody at Northwind established: a fixture number this repo invented,
+# and a provider's structured field the merchant could not check against the
+# page. Both are quotable, both are containable, neither is real money.
+_SIMULATION_ONLY_SOURCES = frozenset({SIMULATION_ONLY_SOURCE, CORROBORATED_EXTERNAL_SOURCE})
+
+# The external provenance a real gateway may see: the merchant opened the
+# product page and read the price itself (merchant/verifier.py).
+_REAL_CHECKOUT_SOURCES = frozenset({VERIFIED_EXTERNAL_SOURCE, MERCHANT_CATALOG_SOURCE})
 
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS external_offers (
@@ -199,7 +231,26 @@ def candidate_matches_scope(title: str, snippet: str, category: str) -> bool:
 def create_offer_from_candidate(
     *, candidate_id: str, intent_mandate_id: str, intent_category: str,
 ) -> Offer:
-    """Create a simulation offer using only a server-captured candidate row."""
+    """Relist a server-captured candidate, at the authority its row carries.
+
+    The candidate's `authority` decides the offer's `source`, and the `source`
+    is what every later gateway check reads. Three rows are listable and one is
+    not:
+
+      * `verified_external` — `merchant/verifier.py` opened the product page and
+        read the price. Real checkout eligible.
+      * `corroborated_external` / `trusted_demo` — a price nobody at Northwind
+        established. Quotable so the simulated lane works end to end; contained
+        to a fake gateway by `is_simulation_only`.
+      * `advisory` — refused here, exactly as before. A raw provider snippet has
+        no merchant price behind it, and this refusal is what
+        `merchant/verifier.py` exists to let a candidate out of. The refusal
+        names the route out so the recovery agent can take it.
+
+    Note what this does NOT do: it does not verify anything itself. Verification
+    fetches a page and can take seconds; the offer boundary is called on the
+    money path and must stay a pure, deterministic decision over a stored row.
+    """
     candidate = candidate_store.get(candidate_id)
     if candidate is None:
         raise OfferError(
@@ -211,15 +262,18 @@ def create_offer_from_candidate(
             "candidate_id belongs to a different authorised run",
             code="candidate_intent_mismatch",
         )
-    if candidate.authority != "trusted_demo":
+    offer_source = _AUTHORITY_TO_SOURCE.get(candidate.authority)
+    if offer_source is None:
         raise OfferError(
             "external search data is advisory and has no verified merchant price; "
-            "checkout is blocked until a merchant adapter verifies it",
+            "checkout is blocked until a merchant adapter verifies it "
+            "(merchant.verifier.verify_candidate)",
             code="candidate_advisory",
         )
     if candidate.price_paise is None:
         raise OfferError(
-            "candidate has no trusted demo price", code="candidate_price_missing"
+            "candidate has no price the merchant can list",
+            code="candidate_price_missing",
         )
     if not candidate_matches_scope(candidate.title, candidate.snippet, intent_category):
         raise OfferError(
@@ -231,18 +285,45 @@ def create_offer_from_candidate(
         url=candidate.url,
         price_paise=candidate.price_paise,
         category=intent_category,
-        source=SIMULATION_ONLY_SOURCE,
+        source=offer_source,
     )
 
 
 def is_simulation_only(source: str) -> bool:
     """Return whether an offer is restricted to a simulated gateway."""
-    return source == SIMULATION_ONLY_SOURCE
+    return source in _SIMULATION_ONLY_SOURCES
 
 
 def candidate_is_simulation_only(candidate: candidate_store.Candidate) -> bool:
-    """Check fixture provenance before creating or persisting an offer."""
-    return candidate.authority == "trusted_demo"
+    """Check for a price no-one at Northwind established, before creating or
+    persisting an offer. True for a fixture price and for a provider price the
+    merchant could not check against the page."""
+    return candidate.authority in (
+        candidate_store.TRUSTED_DEMO,
+        candidate_store.CORROBORATED_EXTERNAL,
+    )
+
+
+def sku_blocks_real_checkout(sku: str) -> bool:
+    """Whether this sku's price has provenance too weak for a real gateway.
+
+    The question every real-money path has to ask about a relisted web find, in
+    one place, resolved from the immutable persisted row rather than from the
+    in-process catalog append — because the process that checks out need not be
+    the process that listed (see tests/test_offer_provenance.py).
+
+    Fails closed twice over: merchant seed inventory is fine, a
+    `verified_external` offer is fine, and EVERYTHING else — fixture,
+    corroborated, an unknown source, an external sku that does not resolve at
+    all — is blocked. A new provenance label added later is therefore refused
+    by default rather than quietly admitted.
+    """
+    if not is_external_offer_sku(sku):
+        return False
+    offer = get_offer(sku)
+    if offer is None:
+        return True
+    return offer.source not in _REAL_CHECKOUT_SOURCES
 
 
 def is_external_offer_sku(sku: str) -> bool:

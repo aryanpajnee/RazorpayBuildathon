@@ -16,6 +16,33 @@ from pathlib import Path
 
 import config
 
+# What a row's `authority` is allowed to say, and what each one buys. Only the
+# first two are assigned at capture time (discovery, and the offline fixture
+# set); the last two are minted by `merchant/verifier.py` onto a DERIVED row and
+# never onto the observation itself.
+#
+#   advisory              a provider snippet. Nothing was checked. Discovery only.
+#   trusted_demo          a fixture price this repo invented. Simulation only.
+#   corroborated_external the page could not be read, but the provider's price
+#                         came from a structured field. Simulation only.
+#   verified_external     the merchant fetched the product page and read the
+#                         price itself. The only external tier a real gateway
+#                         may see.
+ADVISORY = "advisory"
+TRUSTED_DEMO = "trusted_demo"
+CORROBORATED_EXTERNAL = "corroborated_external"
+VERIFIED_EXTERNAL = "verified_external"
+
+_AUTHORITIES = frozenset({ADVISORY, TRUSTED_DEMO, CORROBORATED_EXTERNAL, VERIFIED_EXTERNAL})
+
+# Tiers that only exist as the OUTPUT of merchant-side verification, so a row
+# carrying one must name the observation it was derived from and must carry the
+# price that derivation produced. Both are shape invariants rather than security
+# boundaries -- anything that can call `capture` can pass a parent id -- but they
+# keep an unparented, priceless "verified" row from existing at all, which is the
+# shape a careless caller would otherwise produce.
+_DERIVED_AUTHORITIES = frozenset({CORROBORATED_EXTERNAL, VERIFIED_EXTERNAL})
+
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS product_candidates (
     candidate_id TEXT PRIMARY KEY,
@@ -61,11 +88,31 @@ class Candidate:
 
     @property
     def price_label(self) -> str:
-        return "trusted demo price" if self.authority == "trusted_demo" else "indicative external price"
+        """How this row's price should be described to a human or to the model.
+
+        Each label says what was actually checked, not how confident anyone is:
+        the buyer agent reads this string in its candidate list, so "verified"
+        has to mean the merchant read the page, or the word is worthless.
+        """
+        return {
+            TRUSTED_DEMO: "trusted demo price",
+            VERIFIED_EXTERNAL: "merchant-verified page price",
+            CORROBORATED_EXTERNAL: "provider-listed price, page not verified",
+        }.get(self.authority, "indicative external price")
 
     @property
     def checkout_mode(self) -> str:
-        return "simulation_only" if self.authority == "trusted_demo" else "discovery_only"
+        """How far this row's price may travel.
+
+        `verified_checkout` is the only value that permits a real gateway.
+        Corroboration sits with the fixture tier deliberately: neither price was
+        established by the merchant, so neither may become real money.
+        """
+        if self.authority == VERIFIED_EXTERNAL:
+            return "verified_checkout"
+        if self.authority in (TRUSTED_DEMO, CORROBORATED_EXTERNAL):
+            return "simulation_only"
+        return "discovery_only"
 
     def as_display_dict(self) -> dict:
         return {
@@ -130,8 +177,18 @@ def capture(
         raise CandidateStoreError("candidate price_paise must be an int or None")
     if price_paise is not None and price_paise <= 0:
         raise CandidateStoreError("candidate price_paise must be positive")
-    if authority not in {"advisory", "trusted_demo"}:
+    if authority not in _AUTHORITIES:
         raise CandidateStoreError(f"unsupported candidate authority: {authority}")
+    if authority in _DERIVED_AUTHORITIES:
+        if not parent_candidate_id:
+            raise CandidateStoreError(
+                f"{authority} candidates must name the observation they were "
+                f"derived from (parent_candidate_id)"
+            )
+        if price_paise is None:
+            raise CandidateStoreError(
+                f"{authority} candidates must carry the price that derivation produced"
+            )
 
     candidate = Candidate(
         candidate_id=f"cand_{uuid.uuid4().hex}",

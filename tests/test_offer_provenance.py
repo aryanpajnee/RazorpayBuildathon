@@ -17,6 +17,13 @@ Two questions this file answers with evidence rather than reasoning:
    guards its own gateway call, but that guard sits in the buyer tools and
    `POST /offer -> POST /checkout` never passes through them. The trace tests
    below walk that second path.
+
+3. Which external provenance may a real gateway see at all? There are now three
+   external tiers (`merchant/verifier.py`) -- a merchant-verified page price, a
+   provider-corroborated price the merchant could not check, and a raw advisory
+   snippet -- plus the fixture set. Section 3 asserts the boundary between them
+   from the offer side, and across the process boundary, since the worker that
+   lists an offer need not be the worker that checks it out.
 """
 
 from __future__ import annotations
@@ -25,12 +32,13 @@ import json
 import subprocess
 import sys
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 import config
 from core.mandate import generate_keypair, make_cart_mandate, make_intent_mandate, sign
-from merchant import candidate_store, catalog, intent_store, offers
+from merchant import candidate_store, catalog, intent_store, offers, verifier
 from merchant.api import app
 
 # Run in a genuinely fresh interpreter: import config, point it at the same
@@ -42,7 +50,7 @@ import json, sys
 from pathlib import Path
 import config
 config.OFFERS_DB = Path(sys.argv[1])
-from merchant import catalog
+from merchant import catalog, offers
 sku = sys.argv[2]
 try:
     product = catalog.get_product(sku)
@@ -53,6 +61,9 @@ else:
         "resolved": True,
         "product": product,
         "listed_in_all_products": any(p["sku"] == sku for p in catalog.all_products()),
+        # The provenance question, asked in the process that would actually be
+        # creating the order -- not in the one that listed the offer.
+        "blocks_real_checkout": offers.sku_blocks_real_checkout(sku),
     }))
 """
 
@@ -299,3 +310,226 @@ def test_fixture_quote_cannot_cross_from_simulated_to_real_checkout(client, monk
     assert body["passed"] is True
     assert body["order_error_code"] == "unverified_external_offer"
     assert "order_id" not in body
+
+
+# --- 3. verified external provenance: the one tier real money may see --------
+#
+# `merchant/verifier.py` is the adapter the advisory refusal names. These tests
+# walk the tier boundary it creates from the OFFER side: which sources are
+# simulation-only, which one a real gateway may see, and whether that answer
+# survives the process boundary the money path actually crosses.
+
+
+@pytest.fixture
+def public_dns(monkeypatch):
+    """Keep the SSRF guard's DNS lookup off the network without disabling it."""
+    monkeypatch.setattr(
+        verifier.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))]
+    )
+
+
+def _verified_candidate(payload, *, price_paise: int = 849_900):
+    """An advisory find the merchant has verified by reading its product page.
+
+    The page reader is injected, so this runs the REAL verifier over a stubbed
+    fetch rather than hand-building a row that claims to be verified — a row
+    built by hand would prove nothing about the path a live run takes.
+    """
+    observed = candidate_store.capture(
+        intent_mandate_id=payload["mandate_id"],
+        query="running shoes",
+        title="Verified Trail Running Shoe",
+        url="https://example-shop.test/verified-trail-shoe",
+        seller="ExampleMart",
+        price_paise=price_paise,
+        price_display="₹8,499",
+        source="serper",
+        snippet="ExampleMart · trail running shoe",
+        scope_category="footwear",
+    )
+    result = verifier.verify_candidate(
+        observed.candidate_id,
+        intent_mandate_id=payload["mandate_id"],
+        fetcher=lambda url: f"<html>₹{price_paise // 100}.00</html>",
+    )
+    assert result.authority == verifier.VERIFIED_AUTHORITY
+    return result
+
+
+def _corroborated_candidate(payload):
+    """A find whose page the retailer blocked — the common live outcome."""
+    observed = candidate_store.capture(
+        intent_mandate_id=payload["mandate_id"],
+        query="running shoes",
+        title="Corroborated Trail Running Shoe",
+        url="https://example-shop.test/corroborated-trail-shoe",
+        seller="ExampleMart",
+        price_paise=150_000,
+        price_display="₹1,500",
+        source="serper",
+        snippet="ExampleMart · trail running shoe",
+        scope_category="footwear",
+    )
+
+    def _blocked(url):
+        raise httpx.HTTPStatusError("403 Forbidden", request=None, response=None)
+
+    result = verifier.verify_candidate(
+        observed.candidate_id, intent_mandate_id=payload["mandate_id"], fetcher=_blocked
+    )
+    assert result.authority == verifier.CORROBORATED_AUTHORITY
+    return result
+
+
+def test_a_verified_offer_is_the_only_external_source_real_checkout_admits(
+    public_dns, monkeypatch
+):
+    """The tier table, asserted rather than described. `sku_blocks_real_checkout`
+    is the single predicate every real-money path is meant to consult, so if it
+    ever admitted a fixture or a corroborated price, the containment the rest of
+    this file proves would be decorative."""
+    monkeypatch.setattr(config, "USE_FAKE_GATEWAY", True)
+    payload, fixture_candidate, _sk = _registered_intent_and_candidate()
+
+    verified = _verified_candidate(payload)
+    corroborated = _corroborated_candidate(payload)
+
+    def _relist(candidate_id):
+        return offers.create_offer_from_candidate(
+            candidate_id=candidate_id,
+            intent_mandate_id=payload["mandate_id"],
+            intent_category="footwear",
+        )
+
+    verified_offer = _relist(verified.candidate_id)
+    corroborated_offer = _relist(corroborated.candidate_id)
+    fixture_offer = _relist(fixture_candidate.candidate_id)
+
+    assert verified_offer.source == offers.VERIFIED_EXTERNAL_SOURCE
+    assert not offers.is_simulation_only(verified_offer.source)
+    assert offers.sku_blocks_real_checkout(verified_offer.sku) is False
+
+    assert offers.is_simulation_only(corroborated_offer.source)
+    assert offers.sku_blocks_real_checkout(corroborated_offer.sku) is True
+
+    assert offers.is_simulation_only(fixture_offer.source)
+    assert offers.sku_blocks_real_checkout(fixture_offer.sku) is True
+
+    # Seed inventory was never in question, and must not be caught by what is
+    # supposed to be a provenance check rather than a kill switch.
+    assert offers.sku_blocks_real_checkout("NW-SHOE-001") is False
+
+
+def test_an_external_sku_with_no_persisted_row_blocks_real_checkout():
+    """Fails closed. An external sku the merchant cannot resolve has no
+    provenance at all, which is strictly worse than a known-weak one."""
+    assert offers.sku_blocks_real_checkout(config.OFFER_SKU_PREFIX + "NOTHINGHERE") is True
+
+
+def test_verified_provenance_survives_a_fresh_process(public_dns):
+    """The money-path question for the new tier. The worker that lists an offer
+    need not be the worker that creates the order, and `sku_blocks_real_checkout`
+    reads the persisted row precisely so the answer cannot depend on which
+    process is asking."""
+    payload, _fixture, _sk = _registered_intent_and_candidate()
+    verified = _verified_candidate(payload)
+    offer = offers.create_offer_from_candidate(
+        candidate_id=verified.candidate_id,
+        intent_mandate_id=payload["mandate_id"],
+        intent_category="footwear",
+    )
+
+    out = _resolve_in_fresh_process(offer.sku)
+    assert out["resolved"] is True
+    assert out["product"]["source"] == offers.VERIFIED_EXTERNAL_SOURCE
+    assert out["product"]["price_paise"] == offer.unit_paise
+    assert type(out["product"]["price_paise"]) is int
+    assert out["blocks_real_checkout"] is False
+
+
+def test_a_fixture_sku_still_blocks_real_checkout_in_a_fresh_process():
+    """The negative control for the test above, across the same boundary: a
+    restart must not launder a fixture price into a real-checkout-eligible one."""
+    payload, fixture_candidate, _sk = _registered_intent_and_candidate()
+    offer = offers.create_offer_from_candidate(
+        candidate_id=fixture_candidate.candidate_id,
+        intent_mandate_id=payload["mandate_id"],
+        intent_category="footwear",
+    )
+
+    out = _resolve_in_fresh_process(offer.sku)
+    assert out["resolved"] is True
+    assert out["blocks_real_checkout"] is True
+
+
+def test_the_offer_route_admits_a_verified_candidate_against_a_real_gateway(
+    client, public_dns, monkeypatch
+):
+    """The unblocking, proved through the route the UI actually calls. Before
+    the verifier existed this was a 409 for every live find, which is exactly
+    why 'buy me a coffee machine' could not complete in live mode."""
+    payload, _fixture, _sk = _registered_intent_and_candidate()
+    verified = _verified_candidate(payload)
+    monkeypatch.setattr(config, "USE_FAKE_GATEWAY", False)
+
+    resp = client.post(
+        "/offer",
+        json={
+            "candidate_id": verified.candidate_id,
+            "intent_mandate_id": payload["mandate_id"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["offer"]["source"] == offers.VERIFIED_EXTERNAL_SOURCE
+    assert not offers.is_simulation_only(resp.json()["offer"]["source"])
+
+
+def test_the_offer_route_refuses_a_corroborated_candidate_against_a_real_gateway(
+    client, public_dns, monkeypatch
+):
+    """A price the merchant could not check against the page is contained in the
+    same place, and for the same reason, as a fixture price — early, with a
+    specific error the recovery agent can act on, and before any offer or quote
+    exists to be quoted later."""
+    payload, _fixture, _sk = _registered_intent_and_candidate()
+    corroborated = _corroborated_candidate(payload)
+    monkeypatch.setattr(config, "USE_FAKE_GATEWAY", False)
+
+    resp = client.post(
+        "/offer",
+        json={
+            "candidate_id": corroborated.candidate_id,
+            "intent_mandate_id": payload["mandate_id"],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "simulation_only_offer"
+    assert offers.registered_skus() == []
+
+
+def test_an_advisory_candidate_is_still_refused_by_the_offer_route(client):
+    """Unchanged, and load-bearing: verification is a step the caller takes, not
+    one the offer boundary quietly takes on its behalf."""
+    payload, _fixture, _sk = _registered_intent_and_candidate()
+    advisory = candidate_store.capture(
+        intent_mandate_id=payload["mandate_id"],
+        query="running shoes",
+        title="Unverified Trail Running Shoe",
+        url="https://example-shop.test/unverified",
+        seller="ExampleMart",
+        price_paise=150_000,
+        price_display="₹1,500",
+        source="serper",
+        snippet="ExampleMart · trail running shoe",
+    )
+
+    resp = client.post(
+        "/offer",
+        json={
+            "candidate_id": advisory.candidate_id,
+            "intent_mandate_id": payload["mandate_id"],
+        },
+    )
+    assert resp.status_code >= 400, resp.text
+    assert resp.json()["detail"]["error"] == "candidate_advisory"
+    assert offers.registered_skus() == []
