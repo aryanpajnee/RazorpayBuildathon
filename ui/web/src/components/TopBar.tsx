@@ -1,9 +1,9 @@
 import type { Step } from "../App";
 
 const STEPS: { id: Step; label: string }[] = [
-  { id: "compose", label: "Compose" },
+  { id: "compose", label: "Request" },
   { id: "working", label: "Search" },
-  { id: "verdict", label: "Review" },
+  { id: "review", label: "Review" },
   { id: "payment", label: "Payment" },
 ];
 
@@ -13,22 +13,25 @@ export default function TopBar({ step }: { step: Step }) {
   return (
     <header className="topbar">
       <div className="topbar__inner">
-        <div className="topbar__brand" aria-label="Vera home">
+        <div className="topbar__brand">
           <span className="topbar__mark" aria-hidden="true">V</span>
-          <span className="topbar__wordmark" translate="no">Vera</span>
+          <span className="topbar__word" translate="no">Vera</span>
         </div>
-        <ol className="topbar__steps" aria-label="Shopping progress">
-        {STEPS.map((s, i) => {
-          const state = i < currentIndex ? "done" : i === currentIndex ? "current" : "upcoming";
-          return (
-            <li key={s.id} className={`topbar__step topbar__step--${state}`} aria-current={i === currentIndex ? "step" : undefined}>
-              <span className="topbar__dot" aria-hidden="true" />
-              <span className="topbar__label">{s.label}</span>
-            </li>
-          );
-        })}
-        </ol>
-        <p className="topbar__promise">1 item · your limit</p>
+
+        <nav aria-label="Progress">
+          <ol className="steps">
+            {STEPS.map((s, i) => {
+              const state = i < currentIndex ? "done" : i === currentIndex ? "current" : "todo";
+              return (
+                <li key={s.id} className={`steps__item steps__item--${state}`} aria-current={i === currentIndex ? "step" : undefined}>
+                  <span className="steps__dot" aria-hidden="true" />
+                  <span className="steps__label">{s.label}</span>
+                  {state === "done" ? <span className="sr-only"> (done)</span> : null}
+                </li>
+              );
+            })}
+          </ol>
+        </nav>
       </div>
     </header>
   );

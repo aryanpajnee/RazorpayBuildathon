@@ -1,45 +1,47 @@
-// Integer paise -> "₹5,898.82". No float touches a money value — this module
-// only ever formats numbers that already arrived as integers; it never
-// computes a total.
+// Integer paise -> "₹5,898.82".
+//
+// No float ever touches a money value. These functions only format numbers that
+// already arrived from the server as integers; nothing here computes, sums, or
+// converts a total. Every rendered figure is wrapped in a tabular-numeral class
+// so columns of money line up digit-for-digit.
 export function rupees(paise: number): string {
-  const whole = Math.trunc(paise / 100);
-  const rem = Math.abs(paise % 100);
-  return `₹${whole.toLocaleString("en-IN")}.${String(rem).padStart(2, "0")}`;
+  if (!Number.isFinite(paise)) return "—";
+  const int = Math.trunc(paise);
+  const sign = int < 0 ? "-" : "";
+  const abs = Math.abs(int);
+  const whole = Math.trunc(abs / 100);
+  const rem = abs % 100;
+  return `${sign}₹${whole.toLocaleString("en-IN")}.${String(rem).padStart(2, "0")}`;
 }
 
-export function shortHash(hash: string, n = 16): string {
-  return hash.length > n ? `${hash.slice(0, n)}…` : hash;
+/** Whole rupees typed into the budget field -> paise. Integer in, integer out;
+ * a non-integer input is rejected upstream rather than rounded here. */
+export function rupeesToPaise(wholeRupees: number): number {
+  return Math.trunc(wholeRupees) * 100;
 }
 
-/** "web_search" -> "Web search". Tool/agent identifiers are snake_case on the
- * wire; the console renders them as plain words. */
+export function shortId(value: string, n = 18): string {
+  return value.length > n ? `${value.slice(0, n)}…` : value;
+}
+
+/** "web_search" -> "Web search". Tool and agent identifiers are snake_case on
+ * the wire; the UI renders them as plain words. */
 export function humanize(id: string): string {
   const words = id.replace(/[_-]+/g, " ").trim();
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
-export function timeOf(tsSeconds: number): string {
-  const d = new Date(tsSeconds * 1000);
-  return d.toLocaleTimeString("en-IN", { hour12: false });
+/** Unix seconds -> a short local time, for consent expiry. */
+export function clockTime(unixSeconds: number): string {
+  if (!Number.isFinite(unixSeconds)) return "—";
+  return new Date(unixSeconds * 1000).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
-/** Masthead dateline — "TUESDAY · 2 SEPTEMBER 2026". Purely cosmetic (page
- * furniture), never used for anything the money path depends on. */
-export function dateline(): string {
-  const d = new Date();
-  const weekday = d.toLocaleDateString("en-IN", { weekday: "long" }).toUpperCase();
-  const day = d.getDate();
-  const month = d.toLocaleDateString("en-IN", { month: "long" }).toUpperCase();
-  const year = d.getFullYear();
-  return `${weekday} · ${day} ${month} ${year}`;
-}
-
-/** A deterministic-looking "edition" tag derived from the day of year — pure
- * flavour text for the masthead, not a real record of anything. */
-export function editionNumber(): string {
-  const d = new Date();
-  const start = new Date(d.getFullYear(), 0, 0);
-  const diff = d.getTime() - start.getTime();
-  const dayOfYear = Math.floor(diff / 86_400_000);
-  return `VOL. I — NO. ${String(dayOfYear).padStart(3, "0")}`;
+/** Minutes remaining until a unix-seconds deadline, floored at 0. */
+export function minutesUntil(unixSeconds: number): number {
+  const ms = unixSeconds * 1000 - Date.now();
+  return Math.max(0, Math.round(ms / 60000));
 }

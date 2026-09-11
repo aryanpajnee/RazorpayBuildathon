@@ -7,6 +7,11 @@ export type RunMode = "offline" | "live";
 export interface EventEnvelope {
   seq: number;
   ts: number;
+  /** Present on every frame of a run. The UI drops any event whose run_id is
+   * not the run it started, so a stale or crossed stream can never paint over
+   * the current one. Optional in the type only so an older stream still
+   * renders rather than blanking. */
+  run_id?: string;
 }
 
 export interface RunStarted extends EventEnvelope {
@@ -14,6 +19,9 @@ export interface RunStarted extends EventEnvelope {
   request: string;
   budget_paise: number;
   mode: RunMode;
+  /** The run's bearer capability. Arrives exactly once, on this event, and is
+   * held in memory for the lifetime of the run — never persisted. */
+  run_token?: string;
 }
 
 export interface IntentUnderstood extends EventEnvelope {
@@ -119,6 +127,20 @@ export interface RunComplete extends EventEnvelope {
 export interface RunError extends EventEnvelope {
   type: "run_error";
   error: string;
+}
+
+/** The single payment shape, per contract §1. `status: "paid"` is emitted only
+ * when the server itself verified a full capture — the browser never decides it. */
+export interface PaymentStatus {
+  status: "paid" | "partially_captured" | "failed" | "pending";
+  gateway: "razorpay" | "test-sim";
+  order_id: string;
+  payment_id: string | null;
+  amount_paise: number;
+  captured_amount_paise: number;
+  currency: string;
+  reconciled: boolean;
+  test_mode: boolean;
 }
 
 export type AppEvent =

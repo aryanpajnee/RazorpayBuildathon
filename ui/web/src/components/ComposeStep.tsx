@@ -1,145 +1,162 @@
-// Step 1 — the only real input page. A big serif prompt, a textarea, a
-// budget field, a mode toggle (defaulting to the offline rehearsal), and
-// one primary button. Kept deliberately spare: this is the single place
-// in the whole flow where a person decides anything.
+// Step 1 — the only page where a person decides anything.
+//
+// Two inputs and a mode switch. The state lives in App, not here, because the
+// spending envelope pinned above the workspace has to reflect the cap as it is
+// typed: if this component owned it, the envelope would be a stale copy.
 import { useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { rupees } from "../format";
 import type { RunMode } from "../types";
 
-interface Props {
-  disabled: boolean;
-  onSubmit(request: string, budgetRupees: number, mode: RunMode): void;
+export interface Draft {
+  request: string;
+  budget: string;
+  mode: RunMode;
 }
 
-export default function ComposeStep({ disabled, onSubmit }: Props) {
-  const [request, setRequest] = useState("");
-  const [budget, setBudget] = useState("4000");
-  const [mode, setMode] = useState<RunMode>("offline");
+interface Props {
+  draft: Draft;
+  busy: boolean;
+  error: string | null;
+  onChange(next: Draft): void;
+  onSubmit(): void;
+}
+
+export function draftBudgetRupees(draft: Draft): number | null {
+  const trimmed = draft.budget.trim();
+  if (trimmed === "") return null;
+  const n = Number(trimmed);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+export default function ComposeStep({ draft, busy, error, onChange, onSubmit }: Props) {
+  const [attempted, setAttempted] = useState(false);
   const requestRef = useRef<HTMLTextAreaElement>(null);
   const budgetRef = useRef<HTMLInputElement>(null);
-  const [attempted, setAttempted] = useState(false);
 
-  const budgetRupees = Number(budget);
-  const requestError = attempted && request.trim().length === 0 ? "Describe the 1 item you want Vera to find." : null;
-  const budgetError = attempted && (!Number.isInteger(budgetRupees) || budgetRupees <= 0) ? "Enter a whole-rupee limit above ₹0." : null;
-  const canSubmit = request.trim().length > 0 && Number.isInteger(budgetRupees) && budgetRupees > 0 && !disabled;
+  const budgetRupees = draftBudgetRupees(draft);
+  const requestOk = draft.request.trim().length > 0;
+  const requestError = attempted && !requestOk ? "Describe the one item you want Vera to find." : null;
+  const budgetError = attempted && budgetRupees === null ? "Enter a whole-rupee cap above ₹0." : null;
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setAttempted(true);
-    if (!canSubmit) {
-      if (!request.trim()) requestRef.current?.focus();
-      else budgetRef.current?.focus();
+    if (!requestOk) {
+      requestRef.current?.focus();
       return;
     }
-    onSubmit(request.trim(), Math.round(budgetRupees), mode);
+    if (budgetRupees === null) {
+      budgetRef.current?.focus();
+      return;
+    }
+    onSubmit();
   }
 
   return (
-    <section className="compose" aria-labelledby="compose-title">
-      <div className="compose__intro">
-        <p className="kicker">A careful shopping agent</p>
-        <h1 id="compose-title" className="compose__prompt">What should Vera find for you?</h1>
-        <p className="compose__lede">Set one clear limit. Vera searches, compares, and pauses before any payment.</p>
-        <div className="trust-note">
-          <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6l-7-3Z" /><path d="m9 12 2 2 4-4" /></svg>
-          <p><strong>You stay in control.</strong> Vera can consider 1 item up to the amount you approve.</p>
-        </div>
+    <section className="pane" aria-labelledby="compose-title">
+      <div className="pane__intro">
+        <h1 id="compose-title" className="pane__title">What should Vera buy?</h1>
+        <p className="pane__lede">
+          Vera searches the web, picks one item, and asks a merchant to price it. It cannot pay
+          for anything you have not signed for, and it stops after one purchase.
+        </p>
       </div>
 
-      <form className="compose__form surface" onSubmit={handleSubmit} noValidate>
-        <div className="surface__heading">
-          <h2>Start a search</h2>
-          <span className={mode === "offline" ? "status-pill status-pill--simulated" : "status-pill status-pill--live"}>
-            {mode === "offline" ? "Simulation" : "Live search"}
-          </span>
-        </div>
-        <label className="field">
-          <span className="field__label">What are you looking for?</span>
+      <form className="card" onSubmit={handleSubmit} noValidate>
+        <div className="field">
+          <label className="field__label" htmlFor="request">The item</label>
           <textarea
+            id="request"
             ref={requestRef}
             className="field__textarea"
-            name="request"
-            value={request}
-            onChange={(e) => { setRequest(e.target.value); if (attempted) setAttempted(false); }}
-            placeholder="For example, running shoes in size 9…"
-            rows={4}
+            value={draft.request}
+            onChange={(e) => {
+              onChange({ ...draft, request: e.target.value });
+              if (attempted) setAttempted(false);
+            }}
+            placeholder="Running shoes, men's size 9, cushioned"
+            rows={3}
             maxLength={600}
-            aria-invalid={Boolean(requestError)}
+            aria-invalid={requestError ? true : undefined}
             aria-describedby={requestError ? "request-error" : "request-hint"}
             autoComplete="off"
-            disabled={disabled}
+            disabled={busy}
           />
-          <span id="request-hint" className="field__hint">Include fit, colour, or another detail that matters.</span>
-          {requestError ? <span id="request-error" className="field__error" role="alert">{requestError}</span> : null}
-        </label>
-
-        <div className="compose__row">
-          <label className="field field--budget">
-            <span className="field__label">Maximum spend</span>
-            <div className="field__money">
-              <span className="field__prefix">₹</span>
-              <input
-                ref={budgetRef}
-                className="field__input"
-                type="number"
-                name="budget"
-                inputMode="numeric"
-                min={1}
-                step={1}
-                value={budget}
-                onChange={(e) => { setBudget(e.target.value); if (attempted) setAttempted(false); }}
-                aria-invalid={Boolean(budgetError)}
-                aria-describedby={budgetError ? "budget-error" : "budget-hint"}
-                autoComplete="off"
-                disabled={disabled}
-              />
-              <span className="field__suffix">INR</span>
-            </div>
-            <span id="budget-hint" className="field__hint">A hard limit for 1 item.</span>
-            {budgetError ? <span id="budget-error" className="field__error" role="alert">{budgetError}</span> : null}
-          </label>
-
-          <fieldset className="field field--mode" disabled={disabled}>
-            <legend className="field__label">Search mode</legend>
-            <div className="mode-toggle" role="radiogroup" aria-label="Run mode">
-              <label className={mode === "offline" ? "mode-toggle__option is-active" : "mode-toggle__option"}>
-                <input
-                  type="radio"
-                  name="mode"
-                  value="offline"
-                  checked={mode === "offline"}
-                  onChange={() => setMode("offline")}
-                />
-                Simulated
-              </label>
-              <label className={mode === "live" ? "mode-toggle__option is-active" : "mode-toggle__option"}>
-                <input
-                  type="radio"
-                  name="mode"
-                  value="live"
-                  checked={mode === "live"}
-                  onChange={() => setMode("live")}
-                />
-                Live web
-              </label>
-            </div>
-          </fieldset>
+          {requestError ? (
+            <p id="request-error" className="field__error" role="alert">{requestError}</p>
+          ) : (
+            <p id="request-hint" className="field__hint">Fit, colour or anything else that matters.</p>
+          )}
         </div>
 
-        <div className="budget-envelope" aria-live="polite">
-          <div>
-            <span>Vera’s limit</span>
-            <strong>{Number.isInteger(budgetRupees) && budgetRupees > 0 ? rupees(budgetRupees * 100) : "Set a limit"}</strong>
+        <div className="field">
+          <label className="field__label" htmlFor="budget">Spending cap</label>
+          <div className="money">
+            <span className="money__prefix" aria-hidden="true">₹</span>
+            <input
+              id="budget"
+              ref={budgetRef}
+              className="money__input num"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              step={1}
+              value={draft.budget}
+              onChange={(e) => {
+                onChange({ ...draft, budget: e.target.value });
+                if (attempted) setAttempted(false);
+              }}
+              aria-invalid={budgetError ? true : undefined}
+              aria-describedby={budgetError ? "budget-error" : "budget-hint"}
+              autoComplete="off"
+              disabled={busy}
+            />
+            <span className="money__suffix">INR</span>
           </div>
-          <span className="budget-envelope__scope">1 item</span>
+          {budgetError ? (
+            <p id="budget-error" className="field__error" role="alert">{budgetError}</p>
+          ) : (
+            <p id="budget-hint" className="field__hint">A hard limit for one purchase, in whole rupees.</p>
+          )}
         </div>
 
-        <button className="btn btn--primary compose__submit" type="submit" disabled={disabled}>
-          {disabled ? "Starting Search…" : "Review & Start Search"}
-          <span aria-hidden="true">→</span>
+        <fieldset className="field field--mode" disabled={busy}>
+          <legend className="field__label">Search mode</legend>
+          <div className="segmented" role="radiogroup" aria-label="Search mode">
+            <label className={draft.mode === "offline" ? "segmented__option is-on" : "segmented__option"}>
+              <input
+                type="radio"
+                name="mode"
+                value="offline"
+                checked={draft.mode === "offline"}
+                onChange={() => onChange({ ...draft, mode: "offline" })}
+              />
+              <span>Simulated</span>
+            </label>
+            <label className={draft.mode === "live" ? "segmented__option is-on" : "segmented__option"}>
+              <input
+                type="radio"
+                name="mode"
+                value="live"
+                checked={draft.mode === "live"}
+                onChange={() => onChange({ ...draft, mode: "live" })}
+              />
+              <span>Live web</span>
+            </label>
+          </div>
+          <p className="field__hint">
+            {draft.mode === "live"
+              ? "Vera queries real search providers for current listings."
+              : "Vera reasons over a fixed candidate set. No live web calls."}
+          </p>
+        </fieldset>
+
+        {error ? <p className="field__error" role="alert">{error}</p> : null}
+
+        <button className="btn btn--primary btn--block" type="submit" disabled={busy}>
+          {busy ? "Preparing…" : "Review the terms"}
         </button>
+        <p className="card__foot">You will see exactly what you are signing before anything runs.</p>
       </form>
     </section>
   );
