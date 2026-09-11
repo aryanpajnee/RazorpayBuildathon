@@ -27,17 +27,19 @@ and no write to disk. This is a deliberate, load-bearing use of an
 implementation detail of a frozen module, not an accident to route around —
 see `_live_products()`.
 
-Rejected alternative: persist offers into `data/catalog.json`. That would
-make `data/catalog.json` a moving target written from two different code
-paths (hand-curated inventory vs. buyer-driven demo runs), risk a
-concurrent-write race against `load_catalog()`'s single read at import time,
+Offers live in two places: immutable SQLite rows are authoritative and survive
+process restarts; the cached catalog append only makes new offers visible to
+search in the current process. Gate resolution uses the SQLite fallback by sku.
+
+Rejected alternative: persist offers into `data/catalog.json` instead of a
+separate table. That would make `data/catalog.json` a moving target written
+from two different code paths (hand-curated inventory vs. buyer-driven demo
+runs), risk a concurrent-write race against `load_catalog()`'s single read,
 and leave every demo run's throwaway offers sitting in a tracked file that a
-`git diff` would then have to explain. In-memory registration keeps the
-tracked catalog data clean, keeps offers scoped to (and cleaned up within)
-one process, and needs no locking. The cost is real: offers do not survive a
-process restart. That is the right trade for a demo whose external-offer
-lane is proving "can the merchant relist a web find," not building a second
-inventory system.
+`git diff` would then have to explain. A private, insert-once table keeps
+the tracked catalog data clean and gives immutability for free — an offer
+whose price could be rewritten after a quote was issued would defeat the
+Gate's price-drift check rather than feed it.
 
 The other genuinely-considered alternative was a `catalog.get_product`
 monkeypatch/override registry living in this module instead of touching
@@ -64,6 +66,10 @@ from merchant import candidate_store, catalog
 
 _REGISTERED: set[str] = set()
 
+# Provenance labels assigned by this module, not caller-controlled settings.
+SIMULATION_ONLY_SOURCE = "trusted_demo_fixture"
+MERCHANT_CATALOG_SOURCE = "merchant_catalog"
+
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS external_offers (
     sku TEXT PRIMARY KEY,
@@ -84,7 +90,13 @@ class OfferError(Exception):
     an offer at all — the caller (the buyer's discovery/selection agent) is
     expected to fall back to a different candidate, never to retry with the
     same bad data.
+
+    `code` lets API adapters branch without parsing the human message.
     """
+
+    def __init__(self, message: str, *, code: str = "offer_rejected") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,25 +202,59 @@ def create_offer_from_candidate(
     """Create a simulation offer using only a server-captured candidate row."""
     candidate = candidate_store.get(candidate_id)
     if candidate is None:
-        raise OfferError("unknown candidate_id; search first and select a server-issued candidate")
+        raise OfferError(
+            "unknown candidate_id; search first and select a server-issued candidate",
+            code="unknown_candidate",
+        )
     if candidate.intent_mandate_id != intent_mandate_id:
-        raise OfferError("candidate_id belongs to a different authorised run")
+        raise OfferError(
+            "candidate_id belongs to a different authorised run",
+            code="candidate_intent_mismatch",
+        )
     if candidate.authority != "trusted_demo":
         raise OfferError(
             "external search data is advisory and has no verified merchant price; "
-            "checkout is blocked until a merchant adapter verifies it"
+            "checkout is blocked until a merchant adapter verifies it",
+            code="candidate_advisory",
         )
     if candidate.price_paise is None:
-        raise OfferError("candidate has no trusted demo price")
+        raise OfferError(
+            "candidate has no trusted demo price", code="candidate_price_missing"
+        )
     if not candidate_matches_scope(candidate.title, candidate.snippet, intent_category):
-        raise OfferError("candidate product evidence does not match the signed product scope")
+        raise OfferError(
+            "candidate product evidence does not match the signed product scope",
+            code="candidate_scope_mismatch",
+        )
     return create_offer(
         title=candidate.title,
         url=candidate.url,
         price_paise=candidate.price_paise,
         category=intent_category,
-        source="trusted_demo_fixture",
+        source=SIMULATION_ONLY_SOURCE,
     )
+
+
+def is_simulation_only(source: str) -> bool:
+    """Return whether an offer is restricted to a simulated gateway."""
+    return source == SIMULATION_ONLY_SOURCE
+
+
+def candidate_is_simulation_only(candidate: candidate_store.Candidate) -> bool:
+    """Check fixture provenance before creating or persisting an offer."""
+    return candidate.authority == "trusted_demo"
+
+
+def is_external_offer_sku(sku: str) -> bool:
+    """Return whether this sku identifies a relisted external find."""
+    return sku.startswith(config.OFFER_SKU_PREFIX)
+
+
+def is_merchant_owned_product(product: dict) -> bool:
+    """Return whether a product belongs to merchant-curated seed inventory."""
+    if is_external_offer_sku(str(product.get("sku", ""))):
+        return False
+    return config.OFFER_SOURCE_TAG not in (product.get("tags") or [])
 
 
 def _live_products() -> list[dict]:
@@ -284,7 +330,7 @@ def create_offer(
     buyer's recovery agent re-quoting after a refusal, e.g.), not an error.
     """
     if not title or not title.strip():
-        raise OfferError("offer title must be non-empty")
+        raise OfferError("offer title must be non-empty", code="invalid_offer_title")
 
     # Open vocabulary: any non-empty label is listable, normalised for the Gate's
     # exact-string category match (see normalize_category). We no longer reject a
@@ -292,23 +338,30 @@ def create_offer(
     # the merchant's seed inventory, not a cage on what a web buyer can ask for.
     category = normalize_category(category)
     if not category:
-        raise OfferError("offer category must be a non-empty label")
+        raise OfferError(
+            "offer category must be a non-empty label", code="invalid_offer_category"
+        )
 
     if type(price_paise) is not int:
         raise OfferError(
             f"price_paise must be a genuine int paise value, got "
             f"{type(price_paise).__name__}; a web find with no trustworthy "
-            f"price is not listable"
+            f"price is not listable",
+            code="invalid_offer_price",
         )
     if price_paise <= 0:
-        raise OfferError(f"price_paise must be > 0, got {price_paise}")
+        raise OfferError(
+            f"price_paise must be > 0, got {price_paise}", code="invalid_offer_price"
+        )
 
     if stock is None:
         stock = config.OFFER_DEFAULT_STOCK
     if type(stock) is not int:
-        raise OfferError(f"stock must be an int, got {type(stock).__name__}")
+        raise OfferError(
+            f"stock must be an int, got {type(stock).__name__}", code="invalid_offer_stock"
+        )
     if stock <= 0:
-        raise OfferError(f"stock must be > 0, got {stock}")
+        raise OfferError(f"stock must be > 0, got {stock}", code="invalid_offer_stock")
 
     merchant_price = (
         price_paise * config.OFFER_MARGIN_BPS + config.BPS_DIVISOR // 2
@@ -347,7 +400,9 @@ def create_offer(
     finally:
         conn.close()
     if Offer(*row) != offer:
-        raise OfferError(f"immutable persisted offer collision for {sku}")
+        raise OfferError(
+            f"immutable persisted offer collision for {sku}", code="offer_collision"
+        )
 
     return offer
 

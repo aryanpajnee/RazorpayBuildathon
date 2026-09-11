@@ -36,6 +36,7 @@ that gets charged.
 
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import socket
 from dataclasses import dataclass, field
@@ -45,7 +46,15 @@ import httpx
 from langchain_core.tools import StructuredTool
 
 import config
-from core.mandate import generate_keypair, make_cart_mandate, make_intent_mandate, sign
+from core.mandate import (
+    MANDATE_VERSION,
+    MandateVerificationError,
+    generate_keypair,
+    make_cart_mandate,
+    make_intent_mandate,
+    sign,
+    verify,
+)
 from demo.search import SearchResult, parse_price_to_paise, web_search
 from merchant import candidate_store, gateway, intent_store, offers, quote_store
 from merchant import catalog
@@ -117,6 +126,159 @@ class ToolContext:
             self.search_fn = web_search
 
 
+# --------------------------------------------------------------------------- #
+# Consent that was granted OUTSIDE this process — the browser path
+# --------------------------------------------------------------------------- #
+class ApprovedIntentError(ValueError):
+    """An already-signed Intent Mandate was offered but is not authority here.
+
+    Carries the shared reason code so the HTTP layer maps a refusal to a stable
+    string instead of re-deriving one by reading an English message. A subclass
+    of ValueError, not a bare Exception, so an existing `except ValueError` on a
+    grant path still fails closed rather than escaping as a 500.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedIntent:
+    """An Intent Mandate a BROWSER signed, plus the facts that turn it from
+    merely authentic into actual authority.
+
+    `envelope` arrived over the wire, so it is untrusted input *even though it is
+    signed*. `core.mandate.verify` proves only that whoever holds the key riding
+    inside the envelope produced these exact bytes; an attacker can generate a
+    keypair and hand over a perfectly valid envelope in a second. Permission is
+    answered by `trusted_user_public_key` — the key this device pinned when it
+    registered, looked up server-side, which the request cannot influence.
+
+    `agent_signing_key` is the run-scoped agent key the SERVER minted and holds
+    encrypted at rest. It never reaches the browser and is never read out of the
+    request; it is loaded from the prepared consent. The signed payload's
+    `agent_pubkey` must be exactly this key's public half — otherwise the user
+    signed a grant naming somebody else's agent, and that is the key the Gate
+    would go on to check every Cart Mandate against.
+
+    Rejected alternative: passing the raw envelope straight into `grant_intent`
+    and letting it look the trusted key up itself. That would put a device-store
+    read inside the buyer's toolset and make the trust decision invisible at the
+    call site. Here the two trusted values are named arguments, so a reviewer can
+    see at a glance what is being trusted and where it came from.
+    """
+
+    envelope: dict
+    trusted_user_id: str
+    trusted_user_public_key: str
+    agent_signing_key: object   # nacl SigningKey — server-held, run-scoped
+
+
+def _grant_approved_intent(
+    approved: ApprovedIntent,
+    *,
+    budget_paise: int,
+    category: str | None,
+    search_fn: object,
+    gateway: object,
+) -> ToolContext:
+    """Turn a browser-signed Intent Mandate into this run's authority.
+
+    Same end state as the self-minted path — one registered intent and a
+    ToolContext holding the agent key — but every number and label comes from the
+    SIGNED payload, never from the caller's arguments. The arguments are used
+    only to REFUSE: they must agree with what was signed, and they can never
+    widen it. Getting that backwards is exactly how a run quietly spends more
+    than the human approved.
+    """
+    try:
+        payload = verify(approved.envelope)
+    except MandateVerificationError as exc:
+        raise ApprovedIntentError(
+            "signature_invalid", "consent signature is not valid"
+        ) from exc
+
+    # A valid signature proves ORIGIN, not PERMISSION. `verify` above passes for
+    # whatever key rode inside the envelope, including one an attacker minted
+    # thirty seconds ago over the honest payload. Authority begins on this line:
+    # the signer must be the key this device pinned at registration.
+    signer = approved.envelope.get("public_key")
+    if not isinstance(signer, str) or not hmac.compare_digest(
+        signer, approved.trusted_user_public_key
+    ):
+        raise ApprovedIntentError(
+            "signer_mismatch", "consent was not signed by this device's registered key"
+        )
+
+    if payload.get("type") != "intent" or payload.get("version") != MANDATE_VERSION:
+        raise ApprovedIntentError(
+            "payload_mismatch", "signed document is not an intent mandate"
+        )
+    for field_name in ("mandate_id", "agent_id", "user_id"):
+        if not isinstance(payload.get(field_name), str) or not payload[field_name]:
+            raise ApprovedIntentError(
+                "payload_mismatch", f"signed consent is missing {field_name}"
+            )
+
+    if not hmac.compare_digest(payload["user_id"], approved.trusted_user_id):
+        raise ApprovedIntentError(
+            "signer_mismatch", "signed consent names a different device identity"
+        )
+
+    # The agent key is the server's, not the browser's. A payload naming a
+    # different agent_pubkey is a grant to a key we do not hold — and the Gate
+    # would then check every Cart Mandate against that foreign key, which is the
+    # attacker's, not ours.
+    held_pubkey = approved.agent_signing_key.verify_key.encode().hex()
+    if not hmac.compare_digest(str(payload.get("agent_pubkey", "")), held_pubkey):
+        raise ApprovedIntentError(
+            "payload_mismatch", "signed agent key is not the key held for this consent"
+        )
+
+    signed_category = offers.normalize_category(payload.get("category") or "")
+    if not signed_category:
+        raise ApprovedIntentError(
+            "payload_mismatch", "signed consent carries no product category"
+        )
+    if category is not None and offers.normalize_category(category) != signed_category:
+        raise ApprovedIntentError(
+            "run_mismatch", "this run's category differs from the signed consent"
+        )
+
+    # `type(...) is not int` rather than isinstance: isinstance(True, int) is
+    # True, and a bool sailing through as 1 is a one-paise budget.
+    signed_paise = payload.get("max_paise")
+    if type(signed_paise) is not int or type(budget_paise) is not int:
+        raise ApprovedIntentError("payload_mismatch", "budget must be integer paise")
+    if signed_paise != budget_paise:
+        raise ApprovedIntentError(
+            "run_mismatch", "this run's budget differs from the signed consent"
+        )
+    if payload.get("max_purchases") != 1:
+        raise ApprovedIntentError(
+            "payload_mismatch", "a consent authorises exactly one purchase"
+        )
+    if payload.get("currency") != config.CURRENCY:
+        raise ApprovedIntentError(
+            "payload_mismatch", "signed consent is in a different currency"
+        )
+
+    # Registering the VERIFIED payload is the grant. From here the Gate reads the
+    # intent from the store, not from anything the browser sends again.
+    intent_store.register_intent(payload)
+
+    return ToolContext(
+        sk=approved.agent_signing_key,
+        agent_id=payload["agent_id"],
+        intent_mandate_id=payload["mandate_id"],
+        category=signed_category,
+        budget_paise=signed_paise,
+        search_fn=search_fn,
+        gateway=gateway,
+    )
+
+
 def grant_intent(
     *,
     request: str,
@@ -124,22 +286,46 @@ def grant_intent(
     category: str | None = None,
     search_fn: object = None,
     gateway: object = None,
+    approved: ApprovedIntent,
 ) -> ToolContext:
     """The one-time consent step — the "Authorize & Run" click, in code.
 
-    Mints a fresh agent Ed25519 keypair, derives the agent id from its public
-    key, builds a budget-bounded Intent Mandate scoped to a single category, and
-    registers it. This mirrors `scripts/day1_offer_proof.py` exactly: registering
-    the intent (bound to this agent's public key) IS the grant of authority the
-    Gate later checks a Cart Mandate against.
+    Verifies and registers a budget-bounded Intent Mandate scoped to a single
+    category. Registering the verified intent, bound to the server-held agent
+    key, is the grant of authority the Gate later checks a Cart Mandate against.
 
-    `category` is the OPEN, normalised product label the run is scoped to. When
-    not supplied it is understood from the free-text request by the Intent
-    Compiler LLM (`demo.intent.understand_request`) — the user can ask for
-    anything, not just a fixed list. The label is signed into the intent and the
-    Gate later enforces (deterministically, by exact string match) that the
-    relisted offer carries the same category. The LLM only NAMES the scope; it
-    never sets the price, the budget, or the pay decision.
+    `category` is the open, normalised product label the run is scoped to. The
+    label is signed into the intent and the Gate later enforces it by exact
+    string match against the relisted offer.
+
+    A human already signed this exact Intent Mandate with a non-extractable key
+    held in their browser, and the server
+    verified that signature against the key the device registered. This path
+    mints nothing: it adopts the signed grant. It is the only path the UI uses.
+    """
+    return _grant_approved_intent(
+        approved,
+        budget_paise=budget_paise,
+        category=category,
+        search_fn=search_fn,
+        gateway=gateway,
+    )
+
+
+def grant_fixture_intent(
+    *,
+    request: str,
+    budget_paise: int,
+    category: str | None = None,
+    search_fn: object = None,
+    gateway: object = None,
+) -> ToolContext:
+    """Create a real signed grant for local scripts and hermetic tests.
+
+    This is an explicit local operator boundary, not a browser identity and not
+    an HTTP fallback.  Both ephemeral keys remain in this process; the user key
+    signs the exact Intent Mandate and is then pinned as the trusted fixture
+    signer before the normal approved-grant path accepts it.
     """
     if category is None:
         from demo.intent import understand_request
@@ -148,27 +334,32 @@ def grant_intent(
     if not category:
         raise ValueError(f"could not derive a product category from request {request!r}")
 
-    sk, vk = generate_keypair()
-    agent_id = f"agent_{vk.encode().hex()[:8]}"
+    user_sk, user_vk = generate_keypair()
+    agent_sk, agent_vk = generate_keypair()
+    user_id = f"fixture_user_{user_vk.encode().hex()[:16]}"
+    agent_id = f"agent_{agent_vk.encode().hex()[:16]}"
     intent_payload = make_intent_mandate(
-        user_id="user_demo",
+        user_id=user_id,
         agent_id=agent_id,
-        agent_pubkey=vk.encode().hex(),
+        agent_pubkey=agent_vk.encode().hex(),
         category=category,
         max_paise=budget_paise,
         max_purchases=1,
-        ttl_seconds=3600,
+        ttl_seconds=config.CONSENT_TTL_SECONDS,
     )
-    intent_store.register_intent(intent_payload)
-
-    return ToolContext(
-        sk=sk,
-        agent_id=agent_id,
-        intent_mandate_id=intent_payload["mandate_id"],
-        category=category,
+    approved = ApprovedIntent(
+        envelope=sign(intent_payload, user_sk),
+        trusted_user_id=user_id,
+        trusted_user_public_key=user_vk.encode().hex(),
+        agent_signing_key=agent_sk,
+    )
+    return grant_intent(
+        request=request,
         budget_paise=budget_paise,
+        category=category,
         search_fn=search_fn,
         gateway=gateway,
+        approved=approved,
     )
 
 

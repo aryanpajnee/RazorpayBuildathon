@@ -53,7 +53,7 @@ _fake_search.__vera_candidate_authority__ = "trusted_demo"
 
 def _ctx(budget_rupees, gw=None, category="footwear"):
     # category passed explicitly so these tests never call the LLM understander.
-    return tools.grant_intent(
+    return tools.grant_fixture_intent(
         request="running shoes", budget_paise=budget_rupees * 100, category=category,
         search_fn=_fake_search, gateway=gw or FakeGateway(),
     )
@@ -174,8 +174,8 @@ def test_finish_sets_the_flag():
     assert ctx.finished is True and ctx.summary == "done"
 
 
-def test_grant_intent_accepts_and_normalizes_open_category():
-    ctx = tools.grant_intent(
+def test_fixture_grant_accepts_and_normalizes_open_category():
+    ctx = tools.grant_fixture_intent(
         request="wireless headphones", budget_paise=500_000, category="  Electronics  ")
     assert ctx.category == "electronics" and ctx.intent_mandate_id
 
@@ -200,7 +200,7 @@ def test_external_search_price_is_advisory_and_cannot_be_listed():
     def external_search(query, *, max_results=None):
         return _fake_search(query, max_results=max_results)
 
-    ctx = tools.grant_intent(
+    ctx = tools.grant_fixture_intent(
         request="running shoes", budget_paise=900_000, category="footwear",
         search_fn=external_search, gateway=FakeGateway(),
     )

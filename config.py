@@ -24,6 +24,9 @@ WEBHOOK_EVENTS_DB = DATA_DIR / "webhook_events.db"  # delivered webhook hashes, 
 GATE_NONCES_DB = DATA_DIR / "gate_nonces.db"    # spent cart-mandate nonces, replay defence
 QUOTES_DB = DATA_DIR / "quotes.db"              # issued quotes, looked up by quote_id at gate time
 INTENTS_DB = DATA_DIR / "intents.db"            # granted+verified intents and their purchase counts
+USERS_DB = DATA_DIR / "users.db"                # anonymous device credentials + capability hashes
+CONSENTS_DB = DATA_DIR / "consents.db"          # one-use prepared, signed consent records
+CONSENT_MASTER_KEY = KEY_DIR / "consent-master.key"  # encrypts run-scoped agent seeds at rest
 RUN_LOCK_PATH = DATA_DIR / "agent-run.lock"      # cross-process serialization for UI buyer runs
 
 # --- LLM -------------------------------------------------------------------
@@ -384,6 +387,45 @@ SSE_KEEPALIVE_SECONDS = 15.0
 # quota or fires a real Razorpay call. "live" runs the real agent and is
 # selected by a human, on purpose, before recording.
 UI_DEFAULT_MODE = "offline"
+
+# The console's own budget ceiling. NOT a money-path bound — the Gate enforces
+# the signed max_paise and nothing else — this only stops an obvious typo
+# ("500000000") from being minted into a signed consent in the first place.
+UI_MAX_BUDGET_RUPEES = 1_000_000
+
+
+# --- Signed user consent (browser-held Ed25519) ------------------------------
+# A run's request text is signed, stored, and read back to a human. Capped so a
+# pasted essay cannot bloat the signed payload or the consent record.
+CONSENT_MAX_REQUEST_CHARS = 300
+
+# How long a browser-signed consent is good for. This is deliberately ONE clock.
+# The value becomes the Intent Mandate's `expires_at`, which is the authority
+# expiry the Gate enforces (INTENT_EXPIRED) for the whole run — it is not a UI
+# freshness timer. The 300s first tried here reads tighter but is actively
+# wrong: a live run does web discovery, several model turns, a quote, the Gate
+# and a payment, and a human reads the consent screen before any of it starts,
+# so a five-minute authority window expires legitimate runs mid-flight and the
+# failure surfaces as a Gate refusal that looks like a crypto bug. One hour is
+# the TTL the local signed-fixture path already used and the
+# frozen suite already assumes, so consent inherits it rather than introducing a
+# second, shorter clock that would then have to be reconciled with it.
+#   The window is bounded by what the signature authorises, not by its length:
+#   one consent, single-use, max_purchases=1, under a signed max_paise, usable
+#   only by the device that registered the signing key.
+CONSENT_TTL_SECONDS = 3600
+
+# How long an anonymous browser device credential stays usable. Long on purpose:
+# the device's private key is non-extractable and lives in the browser, so
+# re-registering mints a NEW anonymous identity rather than recovering the old
+# one. An aggressive TTL would silently orphan a demo machine mid-recording.
+DEVICE_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+
+# The product scope a prepared consent is signed under when the caller names
+# none and the run is the hermetic offline rehearsal. MUST equal the category
+# `demo/orchestrator.py::_offline_kwargs` forces, or `demo.agent.run` refuses
+# the prepared context as not matching the run.
+CONSENT_OFFLINE_CATEGORY = "footwear"
 
 # Ordered roster for the dashboard's left column — which agent/component
 # "lights up" as the run progresses. Purely DISPLAY metadata: no code path

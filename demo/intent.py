@@ -65,6 +65,11 @@ def _fallback_category(request: str) -> str:
     return normalize_category(" ".join(words[-3:]))
 
 
+def consent_category(request: str) -> str:
+    """Derive the scope shown and signed before a run, without model or network I/O."""
+    return _fallback_category(request)
+
+
 _intent_invoke = None
 
 

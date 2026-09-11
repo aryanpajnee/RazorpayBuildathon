@@ -6,8 +6,10 @@ vault-code module that already enforces its own rules:
     GET  /catalog/search  -> merchant.catalog.all_products (plain filter)
     POST /quote            -> merchant.catalog.resolve_lines + merchant.quote.create_quote
                                + merchant.quote_store.save_quote + core.ledger.append
-    POST /offer             -> merchant.offers.create_offer (relist a web find),
-                               then the identical /quote recipe above
+    POST /offer             -> merchant.offers.create_offer_from_candidate
+                               (relist a SERVER-CAPTURED web find) or a
+                               merchant-owned sku, then the identical /quote
+                               recipe above
     POST /checkout          -> merchant.gate.check  (the one chokepoint before money),
                                then, only on a pass, merchant.gateway.create_order
     GET  /pay/{order_id}    -> merchant.checkout_page.render_checkout_page (the one
@@ -39,19 +41,19 @@ import json
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictInt
 
 import config
 from core.ledger import all_entries, append
-from merchant import catalog, gateway, intent_store, offers, webhooks
+from merchant import candidate_store, catalog, gateway, intent_store, offers, webhooks
 from merchant.agents import refusal_explainer, sales, storefront, substitution
 from merchant.agents import catalog as catalog_agent
 from merchant.agents import negotiator as merchant_negotiator
 from merchant.catalog import all_products, resolve_lines
 from merchant.checkout_page import render_checkout_page
 from merchant.gate import check
-from merchant.quote import create_quote
-from merchant.quote_store import save_quote
+from merchant.quote import Quote, create_quote
+from merchant.quote_store import get_quote, save_quote
 
 app = FastAPI(title="Northwind Merchant API")
 
@@ -73,21 +75,18 @@ class CheckoutRequest(BaseModel):
 
 
 class OfferRequest(BaseModel):
-    """A web find, on its way to becoming a merchant offer + quote.
+    """Select merchant-owned inventory or a server-captured candidate.
 
-    `price_paise` and `qty` are `StrictInt`: pydantic v2's strict-mode int
-    coercion rejects bool and float at the request boundary (422) rather than
-    silently truncating `1999.0` -> `1999` or accepting `True` as `1` -- the
-    same "no floats touch a monetary value" discipline `offers.create_offer`
-    and `merchant/quote.py` enforce with `type(x) is int`, just applied one
-    layer earlier so a malformed request never even reaches that code.
+    Product fields are intentionally absent and forbidden. Candidate product
+    data comes from the candidate store, and its category comes from the
+    registered intent. `qty` is strict to prevent float/bool coercion.
     """
 
-    title: str
-    url: str | None = None
-    price_paise: StrictInt
-    category: str | None = None
-    source: str = "external"
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str | None = None
+    intent_mandate_id: str | None = None
+    sku: str | None = None
     qty: StrictInt = 1
 
 
@@ -163,6 +162,17 @@ def catalog_search(q: str = "") -> dict:
 def post_quote(body: QuoteRequest) -> dict:
     requests = [item.model_dump() for item in body.items]
 
+    # External offers must retain their candidate + intent binding. Re-quoting
+    # one by sku would launder it through the merchant-catalog surface.
+    if any(offers.is_external_offer_sku(item.sku) for item in body.items):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "candidate_required",
+                "message": "external offers must be quoted through /offer with candidate_id and intent_mandate_id",
+            },
+        )
+
     try:
         lines = resolve_lines(requests)
         quote = create_quote(lines)
@@ -199,49 +209,24 @@ def post_quote(body: QuoteRequest) -> dict:
 # --- offer (relist a web find, then quote it) --------------------------------
 
 
-@app.post("/offer")
-def post_offer(body: OfferRequest) -> dict:
-    """Relist a web find as a real Northwind product and quote it in one call.
+# Keep domain errors independent of HTTP while exposing stable refusal codes.
+_OFFER_ERROR_STATUS: dict[str, int] = {
+    "unknown_candidate": 404,
+    "candidate_intent_mismatch": 403,
+    "candidate_advisory": 403,
+    "candidate_price_missing": 409,
+    "candidate_scope_mismatch": 403,
+}
 
-    This is the seam the canonical flow names as "Merchant Offer/Catalog":
-    everything upstream (a buyer's web search) is untrusted reasoning data;
-    `offers.create_offer` is where the merchant takes ownership of the price
-    and the category, and from there this route reuses the exact same
-    resolve_lines -> create_quote -> save_quote -> ledger recipe `/quote`
-    uses, so a relisted find is quoted through the identical, already-tested
-    path -- no second quoting code path to keep in sync.
-    """
-    category = body.category or offers.map_to_category(body.title)
-    if not category:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "uncategorised_offer",
-                "message": "could not map this find to a merchant category",
-                "title": body.title,
-            },
-        )
 
+def _quote_for(sku: str, qty: int) -> Quote:
+    """Quote either offer lane with one shared error mapping."""
     try:
-        offer = offers.create_offer(
-            title=body.title,
-            url=body.url,
-            price_paise=body.price_paise,
-            category=category,
-            source=body.source,
-        )
-    except offers.OfferError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "offer_rejected", "message": str(exc)},
-        ) from exc
-
-    try:
-        lines = resolve_lines([{"sku": offer.sku, "qty": body.qty}])
-        quote = create_quote(lines)
+        lines = resolve_lines([{"sku": sku, "qty": qty}])
+        return create_quote(lines)
     except catalog.ProductNotFound as exc:
         raise HTTPException(
-            status_code=400,
+            status_code=404,
             detail={"error": "product_not_found", "message": str(exc)},
         ) from exc
     except catalog.OutOfStock as exc:
@@ -254,6 +239,151 @@ def post_offer(body: OfferRequest) -> dict:
             status_code=400,
             detail={"error": "invalid_request", "message": str(exc)},
         ) from exc
+
+
+def _offer_from_candidate(candidate_id: str, intent_mandate_id: str) -> offers.Offer:
+    """Resolve a candidate using its registered intent scope."""
+    intent = intent_store.get_intent(intent_mandate_id)
+    if intent is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "unknown_intent",
+                "message": "no registered intent mandate with that id",
+            },
+        )
+    scope_category = offers.normalize_category(intent.get("category") or "")
+    if not scope_category:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "intent_scope_missing",
+                "message": "the registered intent carries no product scope to relist under",
+            },
+        )
+
+    candidate = candidate_store.get(candidate_id)
+    if candidate is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "unknown_candidate",
+                "message": "unknown candidate_id; search first and select a server-issued candidate",
+            },
+        )
+    if candidate.intent_mandate_id != intent_mandate_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "candidate_intent_mismatch",
+                "message": "candidate_id belongs to a different authorised run",
+            },
+        )
+    # Refuse before persistence; checkout repeats this guard for saved quotes.
+    if offers.candidate_is_simulation_only(candidate) and not config.USE_FAKE_GATEWAY:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "simulation_only_offer",
+                "message": (
+                    "trusted demo fixture prices are simulation-only and cannot be "
+                    "quoted for a real payment gateway"
+                ),
+            },
+        )
+
+    try:
+        return offers.create_offer_from_candidate(
+            candidate_id=candidate_id,
+            intent_mandate_id=intent_mandate_id,
+            intent_category=scope_category,
+        )
+    except offers.OfferError as exc:
+        raise HTTPException(
+            status_code=_OFFER_ERROR_STATUS.get(exc.code, 400),
+            detail={"error": exc.code, "message": str(exc)},
+        ) from exc
+
+
+def _offer_from_catalog_sku(sku: str) -> offers.Offer:
+    """Resolve only the merchant's seed inventory, never a relisted find."""
+    if offers.is_external_offer_sku(sku):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "external_offer_sku",
+                "message": (
+                    "that sku is a relisted web find, not merchant inventory; "
+                    "quote it with the candidate_id it came from"
+                ),
+            },
+        )
+    try:
+        product = catalog.get_product(sku)
+    except catalog.ProductNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "product_not_found", "message": str(exc)},
+        ) from exc
+    if not offers.is_merchant_owned_product(product):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "external_offer_sku",
+                "message": "that product is a relisted web find, not merchant inventory",
+            },
+        )
+    return offers.Offer(
+        sku=product["sku"],
+        name=product["name"],
+        unit_paise=product["price_paise"],
+        category=product["category"],
+        stock=product["stock"],
+        url=None,
+        source=offers.MERCHANT_CATALOG_SOURCE,
+    )
+
+
+@app.post("/offer")
+def post_offer(body: OfferRequest) -> dict:
+    """Quote exactly one trusted candidate or merchant-owned catalog sku."""
+    selectors = [body.candidate_id is not None, body.sku is not None]
+    if sum(selectors) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "offer_selector_required",
+                "message": (
+                    "supply exactly one of candidate_id (with intent_mandate_id) "
+                    "or sku; the merchant prices the item, the caller only names it"
+                ),
+            },
+        )
+
+    if body.candidate_id is not None:
+        if not body.intent_mandate_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "offer_selector_required",
+                    "message": "candidate_id requires the intent_mandate_id it was captured under",
+                },
+            )
+        offer = _offer_from_candidate(body.candidate_id, body.intent_mandate_id)
+        provenance = "captured_candidate"
+    else:
+        if body.intent_mandate_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "offer_selector_required",
+                    "message": "intent_mandate_id belongs with candidate_id, not with sku",
+                },
+            )
+        offer = _offer_from_catalog_sku(body.sku)
+        provenance = "merchant_catalog"
+
+    quote = _quote_for(offer.sku, body.qty)
 
     save_quote(quote)
     # NOTE: the spec for this route also asked for an `offer.listed` ledger
@@ -278,6 +408,7 @@ def post_offer(body: OfferRequest) -> dict:
     )
     return {
         **quote.as_dict(),
+        "provenance": provenance,
         "offer": {
             "sku": offer.sku,
             "name": offer.name,
@@ -313,6 +444,22 @@ def post_checkout(body: CheckoutRequest) -> dict:
         "checked_at": result.checked_at,
     }
     if not result.passed:
+        return response
+
+    # External search has no merchant verifier yet. A quote issued in fixture
+    # mode may persist across a restart or configuration change, so enforce the
+    # simulation boundary again immediately before order creation.
+    quote = get_quote(result.quote_id)
+    if (
+        not config.USE_FAKE_GATEWAY
+        and quote is not None
+        and any(offers.is_external_offer_sku(line.sku) for line in quote.lines)
+    ):
+        intent_store.release_authority(result.cart_mandate_id)
+        response["order_error_code"] = "unverified_external_offer"
+        response["order_error"] = (
+            "external offers cannot reach a real payment gateway until a merchant verifier prices them"
+        )
         return response
 
     # Gate passed. gate.check() already appended `gate.passed`; the money now

@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import config
-from demo.tools import ToolContext, build_tools, grant_intent
+from demo.tools import ToolContext, build_tools, grant_fixture_intent
 from merchant import offers
 
 SYSTEM_PROMPT = """You are an autonomous shopping agent buying ONE item for a user.
@@ -320,9 +320,11 @@ def run(
         )
     _emit_event(on_event, "intent_understood", category=category)
 
-    # 2. The one consent step: mint the agent key, register the signed intent.
+    # 2. Use the pre-authorised browser context. Direct local callers use an
+    #    explicitly named, genuinely signed fixture boundary; HTTP never reaches
+    #    this fallback because ui.server consumes signed browser consent first.
     if context is None:
-        context = grant_intent(
+        context = grant_fixture_intent(
             request=request,
             budget_paise=budget_paise,
             category=category,
