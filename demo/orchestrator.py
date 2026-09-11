@@ -57,12 +57,22 @@ def run_streamed(
     on_result: Callable[[agent.RunResult], None] | None = None,
     on_error: Callable[[str], None] | None = None,
     context=None,
+    model=None,
 ) -> Iterator[dict]:
     """Yield one run's ordered event stream with a stable ``run_id``.
 
     ``run_token`` is included only on ``run_started``. The callbacks execute
     on the worker path, independent of the consumer, so durable status remains
     correct if the browser abandons the stream.
+
+    ``model`` injects a chat model into the run and is for TESTS ONLY — it is
+    how this module's own suite stays hermetic (a `fixtures.ScriptedModel`, no
+    network) without putting a script anywhere near a user-facing run. Neither
+    HTTP caller passes it, so both real modes build the configured model and
+    genuinely reason. Rejected alternative: keeping the script as the offline
+    default and letting tests inherit it. That is what made "Simulated" a replay
+    of one hardcoded shoe purchase, contradicting the UI's own claim that Vera
+    reasons over a fixed candidate set.
     """
     bus = EventBus(maxsize=config.EVENT_QUEUE_MAXSIZE, run_id=run_id)
 
@@ -95,10 +105,15 @@ def run_streamed(
         if on_started is not None:
             on_started()
 
-        run_kwargs = _offline_kwargs() if mode == "offline" else _live_kwargs()
+        run_kwargs = _offline_kwargs(request) if mode == "offline" else _live_kwargs()
         if context is not None:
             run_kwargs["context"] = context
+            # The signed consent is the authority on what this run may shop for,
+            # so its category overrides anything the mode derived. `demo.agent.run`
+            # re-checks the two agree and refuses the run if they do not.
             run_kwargs["category"] = context.category
+        if model is not None:
+            run_kwargs["model"] = model
 
         def _worker() -> None:
             try:
@@ -155,13 +170,41 @@ def run_streamed(
         worker.join()
 
 
-def _offline_kwargs() -> dict:
+def _offline_kwargs(request: str) -> dict:
+    """What makes a run "Simulated": a fixed candidate shelf and a fake gateway.
+
+    Nothing else. The model is deliberately absent from this dict, so
+    `demo.agent.run` builds the CONFIGURED one and the buyer genuinely reasons —
+    it chooses its own search query and its own product, it just never touches
+    the live web or a real gateway. That is the honest reading of "simulated",
+    and the only one that matches what the UI tells the user.
+
+    Three things this function must never do again:
+
+    * Pin a category. It used to hardcode "footwear", so every simulated run
+      shopped for shoes no matter what the user typed. The category belongs to
+      the run's signed consent, which `run_streamed` layers over this dict; the
+      derivation below is only for direct, consent-free callers (tests, proof
+      scripts), and it reads the request rather than ignoring it.
+    * Script the model. A `ScriptedModel` here replays a pre-written purchase and
+      presents it as the agent's judgement — the exact fake the project's rules
+      forbid, and the second half of the coffee-machine-buys-sneakers bug.
+    * Fall back to either of those when the model is unavailable. If the model
+      cannot be built or a turn fails, `demo.agent.run` ends the run with an
+      honest status (`no_model` / `stopped`) that the event stream surfaces. A
+      run that visibly fails is a working demo of an honest system; a run that
+      quietly substitutes a canned purchase is a broken one that looks fine.
+
+    `consent_category` is the same deterministic, network-free derivation the
+    consent step uses, so a direct caller gets the label the user would have been
+    shown and signed — and this module's tests stay hermetic.
+    """
     from demo import fixtures
+    from demo.intent import consent_category
     from merchant.gateway import FakeGateway
 
     return {
-        "category": "footwear",
-        "model": fixtures.happy_path_script(),
+        "category": consent_category(request),
         "search_fn": fixtures.fake_search,
         "gateway": FakeGateway(),
     }

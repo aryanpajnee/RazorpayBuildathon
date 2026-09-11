@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage
 from demo.fixtures import (
     CHEAP_HEADPHONES,
     CHEAP_SHOE,
+    FIXTURE_SETS,
     ScriptedModel,
     fake_search,
     happy_path_script,
@@ -171,3 +172,119 @@ def test_happy_path_uses_the_named_cheap_shoe_fixture() -> None:
     listing = model.invoke([])
     args = listing.tool_calls[0]["args"]
     assert args == {"candidate_id": "$candidate_1"}
+
+
+# --------------------------------------------------------------------------- #
+# The shelf itself — properties every shipped fixture set must hold. Simulated
+# mode runs a REAL model over these rows, so a careless row here is a bad demo,
+# and a missing row is a request Vera cannot answer.
+# --------------------------------------------------------------------------- #
+def _priced_rows() -> list:
+    return [
+        row
+        for fixture_set in FIXTURE_SETS
+        for row in fixture_set.results
+        if row.price_paise is not None
+    ]
+
+
+def test_a_coffee_machine_query_returns_coffee_machines_not_shoes() -> None:
+    """The regression. `fake_search` used to default every unmatched query to
+    the shoe set, so this exact request came back with running sneakers."""
+    results = fake_search("coffee machine")
+    assert results, "a coffee-machine query must find candidates"
+    titles = [r.title.lower() for r in results]
+    assert all("shoe" not in t and "sneaker" not in t for t in titles), titles
+    assert any("coffee" in t for t in titles), titles
+
+
+def test_espresso_phrasing_reaches_the_same_shelf() -> None:
+    """A user says 'espresso maker', not 'coffee machine'. The model picks its
+    own query words, so the shelf has to answer the obvious synonyms."""
+    assert fake_search("espresso maker") == fake_search("coffee machine")
+
+
+def test_an_unmatched_query_returns_nothing_rather_than_a_default_product() -> None:
+    """An honest empty result is correct; substituting an unrelated product is
+    the bug. `demo/tools.py::web_search_tool` renders [] as readable
+    "no candidates found" text the model can act on."""
+    assert fake_search("flux capacitor") == []
+    assert fake_search("") == []
+
+
+def test_every_fixture_set_can_demonstrate_both_a_buy_and_a_refusal() -> None:
+    """Each shelf must hold something under its demo budget AND something over
+    it — the OVER_LIMIT refusal is the headline demo and must stay reachable for
+    every category, not just shoes."""
+    for fixture_set in FIXTURE_SETS:
+        priced = [r.price_paise for r in fixture_set.results if r.price_paise is not None]
+        budget = fixture_set.demo_budget_paise
+        assert any(p < budget for p in priced), f"{fixture_set.name}: nothing in budget"
+        assert any(p > budget for p in priced), f"{fixture_set.name}: nothing over budget"
+
+
+def test_every_fixture_price_is_genuine_positive_int_paise() -> None:
+    """`type(x) is int`, not isinstance: `isinstance(True, int)` is True, and a
+    bool or a float price would be caught downstream by
+    `merchant/offers.py::create_offer` — but a fixture should never be the thing
+    that tests that check."""
+    for row in _priced_rows():
+        assert type(row.price_paise) is int, row.title
+        assert row.price_paise > 0, row.title
+
+
+def test_every_fixture_display_price_matches_its_paise_value() -> None:
+    """The model reads the display string when it reasons about affordability,
+    so a display that disagrees with the paise integer would be teaching it a
+    lie — and hiding a rupee/paise scaling error."""
+    for row in _priced_rows():
+        assert row.price_display == f"₹{row.price_paise // 100:,}", row.title
+
+
+def test_every_fixture_row_is_identifiable_and_fixture_sourced() -> None:
+    for fixture_set in FIXTURE_SETS:
+        for row in fixture_set.results:
+            assert row.title.strip(), fixture_set.name
+            assert row.url.startswith("https://"), row.title
+            assert row.source == "fixture", row.title
+            assert row.snippet.strip(), row.title
+
+
+def test_fixture_urls_are_unique_per_row() -> None:
+    """Two rows sharing a url would collapse into one offer sku downstream."""
+    urls = [row.url for fixture_set in FIXTURE_SETS for row in fixture_set.results]
+    assert len(urls) == len(set(urls))
+
+
+def test_every_shelf_answers_its_own_name() -> None:
+    """The set's name is what a user would type; it must reach its own shelf."""
+    for fixture_set in FIXTURE_SETS:
+        assert fake_search(fixture_set.name) == list(fixture_set.results), fixture_set.name
+
+
+def test_fake_search_is_deterministic_for_a_newly_added_category() -> None:
+    assert fake_search("coffee machine") == fake_search("coffee machine")
+    assert fake_search("yoga mat") == fake_search("yoga mat")
+
+
+def test_fake_search_keeps_the_trusted_demo_authority_marker() -> None:
+    """The provenance boundary keys off this exact attribute to make fixture
+    prices eligible for SIMULATED checkout only. Losing it silently blocks every
+    simulated purchase; renaming it silently widens what counts as trusted."""
+    assert fake_search.__vera_candidate_authority__ == "trusted_demo"
+
+
+def test_a_coffee_machine_candidate_matches_a_coffee_machine_scope() -> None:
+    """The fixture rows have to survive the merchant's own scope check, or a
+    simulated run dies at `create_offer_from_candidate` instead of buying."""
+    scope = "coffee machine"
+    matched = [
+        r for r in fake_search("coffee machine")
+        if offers.candidate_matches_scope(r.title, r.snippet, scope)
+    ]
+    assert len(matched) == len(fake_search("coffee machine"))
+    # And the shoe rows must NOT pass that same scope — the check is doing work.
+    assert not any(
+        offers.candidate_matches_scope(r.title, r.snippet, scope)
+        for r in fake_search("running shoes")
+    )
