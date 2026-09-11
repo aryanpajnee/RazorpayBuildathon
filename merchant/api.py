@@ -453,7 +453,7 @@ def post_checkout(body: CheckoutRequest) -> dict:
     if (
         not config.USE_FAKE_GATEWAY
         and quote is not None
-        and any(offers.is_external_offer_sku(line.sku) for line in quote.lines)
+        and any(offers.sku_blocks_real_checkout(line.sku) for line in quote.lines)
     ):
         intent_store.release_authority(result.cart_mandate_id)
         response["order_error_code"] = "unverified_external_offer"

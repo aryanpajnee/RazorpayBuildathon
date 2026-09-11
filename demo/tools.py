@@ -37,10 +37,7 @@ that gets charged.
 from __future__ import annotations
 
 import hmac
-import ipaddress
-import socket
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
 
 import httpx
 from langchain_core.tools import StructuredTool
@@ -56,7 +53,7 @@ from core.mandate import (
     verify,
 )
 from demo.search import SearchResult, parse_price_to_paise, web_search
-from merchant import candidate_store, gateway, intent_store, offers, quote_store
+from merchant import candidate_store, gateway, intent_store, offers, quote_store, verifier
 from merchant import catalog
 from merchant.catalog import resolve_lines
 from merchant.gate import check as gate_check
@@ -378,27 +375,14 @@ def _url_is_fetchable(url: str) -> bool:
     loopback, link-local (e.g. 169.254.169.254 cloud metadata), reserved,
     multicast or unspecified IP is refused. `open_product` also fetches with
     redirects OFF, so this check cannot be bypassed by a 302 to an internal host.
+
+    The rule itself lives in `merchant/verifier.py`, which fetches the same
+    untrusted URLs from the merchant side. Two copies of an SSRF allowlist is
+    one copy too many: the day someone tightens one, the other silently keeps
+    admitting what it always did. Delegating here means "is this URL safe to
+    fetch" has exactly one answer in this codebase.
     """
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return False
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        return False
-    try:
-        port = parts.port or (443 if parts.scheme == "https" else 80)
-        infos = socket.getaddrinfo(parts.hostname, port, proto=socket.IPPROTO_TCP)
-    except (OSError, ValueError):
-        return False
-    for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False
-        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-                or ip.is_multicast or ip.is_unspecified):
-            return False
-    return True
+    return verifier.url_is_fetchable(url)
 
 
 def _format_candidates(results: list[candidate_store.Candidate]) -> str:
@@ -526,11 +510,19 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
         price_paise: int | None = None,
         source: str | None = None,
     ) -> str:
-        """Select a server-issued candidate id for a simulation quote.
+        """Ask the merchant to price a server-issued candidate and quote it.
 
         Product fields are loaded from the captured record. Optional echoed
         fields are accepted only to return a clear refusal when a model tries
         to alter them; they never become offer inputs.
+
+        A candidate straight off the web is `advisory` — a provider's snippet
+        that nobody at Northwind has checked — and the offer boundary refuses
+        it. So this is where the merchant does its own work: it re-reads the
+        product page and derives the price it is prepared to own. That step can
+        refuse (the retailer blocks bots, the page shows no price, the page
+        disagrees with the listing), and a refusal is an ordinary outcome the
+        model recovers from by picking a different candidate — not an error.
         """
         try:
             candidate = candidate_store.get(candidate_id)
@@ -544,6 +536,15 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
                     raise offers.OfferError(
                         f"altered {field_name} rejected; candidate fields are server-controlled"
                     )
+            # Verification mints a DERIVED candidate carrying the merchant's own
+            # price; the observation is left untouched, so a later verification
+            # at a moved price becomes a different candidate and a different
+            # sku, never a silent reprice of a quote the Gate already saw.
+            if candidate.authority == candidate_store.ADVISORY:
+                verified = verifier.verify_candidate(
+                    candidate_id, intent_mandate_id=context.intent_mandate_id
+                )
+                candidate_id = verified.candidate_id
             offer = offers.create_offer_from_candidate(
                 candidate_id=candidate_id,
                 intent_mandate_id=context.intent_mandate_id,
@@ -595,10 +596,15 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
             context.gateway is None and config.USE_FAKE_GATEWAY
         )
         product = catalog.get_product(quote.lines[0].sku)
-        if product.get("source") == "trusted_demo_fixture" and not simulated:
+        # Ask the provenance question by intent, not by naming one source string:
+        # a fixture price and a price the merchant could only corroborate are
+        # both prices nobody at Northwind established, and neither may become a
+        # real charge. A corroborated offer cannot exist in a real-gateway
+        # process at all, so this is defence in depth rather than the only guard.
+        if offers.is_simulation_only(product.get("source") or "") and not simulated:
             return (
-                "Checkout blocked: trusted demo fixture prices are simulation-only "
-                "and cannot be sent to a real payment gateway."
+                "Checkout blocked: this price is simulation-only (no merchant-verified "
+                "page price) and cannot be sent to a real payment gateway."
             )
         cart_payload = make_cart_mandate(
             intent_mandate_id=context.intent_mandate_id,

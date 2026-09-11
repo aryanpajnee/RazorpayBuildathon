@@ -13,6 +13,7 @@ import tempfile
 import pytest
 
 import config
+from merchant import candidate_store, verifier
 
 _tmp = pathlib.Path(tempfile.mkdtemp(prefix="test_tools_"))
 config.LEDGER_DB = _tmp / "ledger.db"
@@ -196,18 +197,56 @@ def test_candidate_identity_is_bound_to_the_authorised_run():
     assert "different authorised run" in out
 
 
-def test_external_search_price_is_advisory_and_cannot_be_listed():
+def _external_ctx():
+    """A run whose search results carry no trusted-demo marker -- i.e. exactly
+    the shape a real Tavily/Serper/DDG result arrives in."""
     def external_search(query, *, max_results=None):
         return _fake_search(query, max_results=max_results)
 
-    ctx = tools.grant_fixture_intent(
+    return tools.grant_fixture_intent(
         request="running shoes", budget_paise=900_000, category="footwear",
         search_fn=external_search, gateway=FakeGateway(),
     )
+
+
+def test_an_unverifiable_external_price_cannot_be_listed(monkeypatch):
+    """The merchant tries to verify a web find and refuses when it cannot.
+
+    The refusal text is deliberately not asserted verbatim -- the merchant may
+    refuse at the fetch, at the parse, or at the price comparison, and all three
+    are honest. What must hold is that an external price nobody at Northwind
+    could check never becomes a quote.
+    """
+    monkeypatch.setattr(
+        verifier, "fetch_page_text",
+        lambda url, **kw: (_ for _ in ()).throw(RuntimeError("retailer blocked the fetch")),
+    )
+    ctx = _external_ctx()
     t = _tools_by_name(ctx)
     out = t["list_with_merchant"].func(candidate_id=_candidate_id(ctx, t))
-    assert "external search data is advisory" in out
+    assert "Could not list that item" in out
     assert ctx.last_quote_id is None
+
+
+def test_a_verified_external_price_becomes_a_quote(monkeypatch):
+    """The other half: once the merchant has read the page itself, the same
+    candidate IS listable. Without this, the refusal above could be passing
+    because nothing external is ever listable, which was the live-mode bug."""
+    ctx = _external_ctx()
+    t = _tools_by_name(ctx)
+    candidate_id = _candidate_id(ctx, t)
+    listed = candidate_store.get(candidate_id)
+    # The fixture urls use a .test TLD that deliberately does not resolve, so
+    # the SSRF guard would refuse before any fetch. Stand it down for this one
+    # test -- it is exercised properly in tests/test_verifier.py.
+    monkeypatch.setattr(verifier, "url_is_fetchable", lambda url: True)
+    monkeypatch.setattr(
+        verifier, "fetch_page_text",
+        lambda url, **kw: f"<html>Price: Rs {listed.price_paise // 100}</html>",
+    )
+    out = t["list_with_merchant"].func(candidate_id=candidate_id)
+    assert "Listed with Northwind" in out, out
+    assert ctx.last_quote_id is not None
 
 
 def test_fixture_offer_cannot_reach_a_real_gateway():

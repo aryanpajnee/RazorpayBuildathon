@@ -285,6 +285,31 @@ AGENT_LLM_PURPOSE = "buyer_brain"       # LLM gateway `purpose` for the buyer lo
 OPEN_PRODUCT_TIMEOUT_SECONDS = 8.0      # per-fetch HTTP timeout for the open_product tool (read-only page fetch)
 OPEN_PRODUCT_MAX_BYTES = 500_000        # cap bytes read from a product page, so a huge page can't stall a run
 
+# --- merchant-side price verification --------------------------------------
+# The merchant re-reads a web find's own product page before it will own the
+# price. Same fetch shape as open_product above, but on the MERCHANT side of the
+# boundary, so it gets its own settings rather than borrowing the buyer's.
+VERIFIER_TIMEOUT_SECONDS = 8.0
+VERIFIER_MAX_BYTES = 500_000
+VERIFIER_USER_AGENT = "NorthwindMerchantVerifier/1.0"
+
+# How far the page price may sit from the price the search provider listed before
+# the merchant calls it a different product rather than a price move. Integer
+# basis points, compared by cross-multiplication -- no float touches this.
+# Measured reason for the bound rather than "page always wins": real retail pages
+# are full of currency-marked numbers that are not the product's price (a live
+# probe read boAt's page as Rs 15 and Reliance Digital's as Rs 1500, both
+# banners). A large gap is evidence the number is not this product's.
+VERIFIER_PRICE_TOLERANCE_BPS = 1_000     # 10%
+
+# When the page cannot be read at all, a provider's STRUCTURED price field may
+# still corroborate the listing -- but a corroborated price is simulation-only
+# and is minted only while the fake gateway is in use, so it can never become a
+# real charge. A price regexed out of prose corroborates nothing, hence the
+# explicit source list.
+VERIFIER_ALLOW_CORROBORATION = True
+VERIFIER_STRUCTURED_PRICE_SOURCES = ("serper",)
+
 # --- Phase 6: red team ------------------------------------------------------
 # Where the Attack Judge (#15) writes its per-attack findings, one JSON file
 # each. Curated into FAILURES.md by hand — the directory is the machine's
