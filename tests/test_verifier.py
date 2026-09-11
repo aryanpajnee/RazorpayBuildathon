@@ -712,3 +712,42 @@ def _assert_not_quotable(observed: candidate_store.Candidate) -> None:
         )
     assert exc.value.code == "candidate_advisory"
     assert offers.registered_skus() == []
+
+
+def test_a_resolved_url_reattributes_the_seller_to_the_host_that_was_read():
+    """A Serper listing sourced to one storefront often resolves to another.
+
+    The merchant read the price at the resolved host, so that is the storefront
+    the verified row must name -- otherwise the UI prints the listing's seller
+    beside a link to somewhere else and credits a verified price to a shop
+    nobody checked.
+    """
+    candidate = _advisory(seller="Nykaa Fashion", price_paise=439_900,
+                          url="https://www.google.com/search?ibp=oshop&q=x")
+    derived = verifier._capture_derived(
+        candidate,
+        price_paise=439_900,
+        price_display="₹4,399",
+        evidence_kind="page_fetch",
+        authority=candidate_store.VERIFIED_EXTERNAL,
+        db_path=None,
+        url="https://www.wonderchef.com/products/regenta-espresso-coffee-maker",
+    )
+    assert derived.seller == "wonderchef.com"
+
+
+def test_an_unmoved_url_keeps_the_listing_seller():
+    """When resolution did not move the url, the listing's seller is still the
+    storefront the price was read from -- do not blank it out."""
+    candidate = _advisory(seller="Croma", price_paise=214_900,
+                          url="https://www.croma.com/p/12345")
+    derived = verifier._capture_derived(
+        candidate,
+        price_paise=214_900,
+        price_display="₹2,149",
+        evidence_kind="page_fetch",
+        authority=candidate_store.VERIFIED_EXTERNAL,
+        db_path=None,
+        url="https://www.croma.com/p/12345",
+    )
+    assert derived.seller == "Croma"

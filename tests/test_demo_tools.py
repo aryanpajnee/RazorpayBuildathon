@@ -260,3 +260,45 @@ def test_fixture_offer_cannot_reach_a_real_gateway():
     out = t["sign_and_submit"].func()
     assert "simulation-only" in out
     assert ctx.order is None
+
+
+def test_a_verified_listing_reports_the_merchant_read_url_not_the_search_redirect(monkeypatch):
+    """The UI's product link must come from the row the merchant listed.
+
+    A Serper shopping result's url is a google.com/search redirect, not a
+    product page. Verification derives a new candidate holding the real product
+    url the merchant read the price from; naming the model's original candidate
+    put "Amazon.in" beside a link that opened Google.
+    """
+    ctx = _external_ctx()
+    t = _tools_by_name(ctx)
+    named = _candidate_id(ctx, t)
+    observed = candidate_store.get(named)
+    real_url = "https://www.amazon.in/dp/B000REALPRODUCT"
+
+    monkeypatch.setattr(verifier, "url_is_fetchable", lambda url: True)
+    monkeypatch.setattr(
+        verifier, "fetch_page_text",
+        lambda url, **kw: f"<html>Price: Rs {observed.price_paise // 100}</html>",
+    )
+    monkeypatch.setattr(
+        candidate_store, "capture",
+        _capturing_real_url(candidate_store.capture, real_url),
+    )
+
+    out = t["list_with_merchant"].func(candidate_id=named)
+    assert "Listed with Northwind" in out, out
+
+    listed = candidate_store.get(ctx.last_listed_candidate_id)
+    assert ctx.last_listed_candidate_id != named, "verification must derive a new row"
+    assert listed.url == real_url
+    assert listed.parent_candidate_id == named
+
+
+def _capturing_real_url(original, real_url):
+    """Stand in for the verifier reading a real product url off the page."""
+    def capture(**kwargs):
+        if kwargs.get("parent_candidate_id"):
+            kwargs["url"] = real_url
+        return original(**kwargs)
+    return capture

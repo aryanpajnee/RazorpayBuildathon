@@ -175,13 +175,24 @@ def _emit_product_chosen(on_event: "Callable[..., None] | None", context, args: 
     back when a one-search script drove every demo run, which is why it went
     unnoticed. The store still has the row.
 
+    The id preferred is the one the merchant actually LISTED
+    (`context.last_listed_candidate_id`), not the one the model named. When a
+    live find is verified, the merchant derives a new candidate row holding its
+    own price and the real product URL it read that price from; the advisory row
+    the model picked still carries whatever the search provider returned, which
+    for a Serper shopping result is a `google.com/search?ibp=oshop&...` redirect
+    rather than a product page. Reading the model's id there put "Amazon.in" next
+    to a link that opened Google, for an item genuinely bought from Amazon.
+
     Display only. The enforced total is the merchant's re-derived quote and the
     checkout binding is the server-side candidate row; nothing here is read back
     into a money decision.
     """
     if on_event is None:
         return
-    candidate_id = args.get("candidate_id") if isinstance(args.get("candidate_id"), str) else ""
+    named = args.get("candidate_id") if isinstance(args.get("candidate_id"), str) else ""
+    listed = getattr(context, "last_listed_candidate_id", None)
+    candidate_id = listed or named
 
     match = {}
     if candidate_id:
@@ -192,9 +203,12 @@ def _emit_product_chosen(on_event: "Callable[..., None] | None", context, args: 
         if stored is not None:
             match = stored.as_display_dict()
     if not match:
+        # The in-memory fallback only ever held rows the SEARCH produced, so it
+        # is keyed by the id the model named -- a derived verification id was
+        # never in it.
         candidates = context.last_candidates or []
         match = next(
-            (c for c in candidates if candidate_id and c.get("candidate_id") == candidate_id),
+            (c for c in candidates if named and c.get("candidate_id") == named),
             None,
         ) or {}
 
@@ -273,11 +287,13 @@ def _emit_tool_side_effects(
                 )
             # Display-only: name the product the buyer just listed, so the UI can
             # show a real, clickable link to the exact item chosen -- at approval,
-            # on the gateway hand-off, and on the receipt. Sourced from the REAL
-            # search candidate (authoritative web data the search tool captured),
-            # preferring it over the model's echoed tool args, which an LLM can
-            # truncate or mangle. NEVER read back into a money decision: the
-            # merchant's re-derived quote above is the only enforced number.
+            # on the gateway hand-off, and on the receipt. Sourced from the row
+            # the MERCHANT listed (server-side, and for a verified find the row
+            # holding the product URL the merchant actually read), never from the
+            # model's echoed tool args, which an LLM can truncate or mangle.
+            # Reached only when a new quote exists, so the id cannot be stale.
+            # NEVER read back into a money decision: the merchant's re-derived
+            # quote above is the only enforced number.
             _emit_product_chosen(on_event, context, args)
         return
 

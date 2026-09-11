@@ -402,13 +402,27 @@ def _capture_derived(
     putting attacker-controlled page text in there would let any page satisfy
     the signed product scope just by containing the right word. The scope check
     keeps judging the same search-result evidence the human saw.
+
+    The seller, though, DOES move to the resolved host. The search provider names
+    whichever storefront its listing came from, and URL resolution often lands on
+    a different one -- a Serper row sourced to "Nykaa Fashion" resolved to
+    wonderchef.com, and the merchant then read the price there. Keeping the
+    listing's seller would print "Nykaa Fashion" beside a wonderchef.com link and
+    attribute a verified price to a storefront nobody checked. Name the host the
+    price actually came from, and fall back to the listing's seller when the url
+    did not move.
     """
+    resolved_seller = candidate.seller
+    if url and url != candidate.url:
+        host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
+        resolved_seller = host or candidate.seller
+
     return candidate_store.capture(
         intent_mandate_id=candidate.intent_mandate_id,
         query=candidate.query,
         title=candidate.title,
         url=url or candidate.url,
-        seller=candidate.seller,
+        seller=resolved_seller,
         price_paise=price_paise,
         price_display=price_display,
         source=candidate.source,

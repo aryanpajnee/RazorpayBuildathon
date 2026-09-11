@@ -117,6 +117,14 @@ class ToolContext:
     # and a refusal -- the UI's Gate visualisation needs the refusal shape too.
     last_candidates: list[dict] | None = None
     last_gate_result: object = None  # merchant.gate.GateResult once sign_and_submit has run
+    # The candidate the merchant actually listed -- which is NOT the id the model
+    # named when verification ran. Verification derives a new row carrying the
+    # merchant's own price and the real product URL it read that price from,
+    # while the advisory parent keeps whatever the search provider handed over
+    # (for Serper shopping rows, a google.com redirect that is not a product page
+    # at all). The UI's product link has to come from the derived row or it sends
+    # a buyer to Google for an item bought from Amazon.
+    last_listed_candidate_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.search_fn is None:
@@ -550,6 +558,7 @@ def build_tools(context: ToolContext) -> list[StructuredTool]:
                 intent_mandate_id=context.intent_mandate_id,
                 intent_category=context.category,
             )
+            context.last_listed_candidate_id = candidate_id
             lines = resolve_lines([{"sku": offer.sku, "qty": 1}])
             quote = create_quote(lines)
             quote_store.save_quote(quote)
