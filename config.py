@@ -421,12 +421,6 @@ CONSENT_TTL_SECONDS = 3600
 # one. An aggressive TTL would silently orphan a demo machine mid-recording.
 DEVICE_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
 
-# The product scope a prepared consent is signed under when the caller names
-# none and the run is the hermetic offline rehearsal. MUST equal the category
-# `demo/orchestrator.py::_offline_kwargs` forces, or `demo.agent.run` refuses
-# the prepared context as not matching the run.
-CONSENT_OFFLINE_CATEGORY = "footwear"
-
 # Ordered roster for the dashboard's left column — which agent/component
 # "lights up" as the run progresses. Purely DISPLAY metadata: no code path
 # reads `id` to route logic, it only labels events for the UI. Order follows

@@ -72,3 +72,20 @@ def test_understand_falls_back_when_groq_key_missing(monkeypatch):
     monkeypatch.setattr(di, "_intent_invoke", None, raising=False)
     out = understand_request("buy me wireless headphones under 5000")
     assert out and "headphone" in out
+
+
+def test_purpose_clause_does_not_become_part_of_the_scope():
+    """"a coffee machine for my kitchen" must scope to the machine, not the
+    kitchen. The label is shown to a human and then signed, so a trailing
+    purpose phrase leaking into it changes what they are agreeing to."""
+    assert _fallback_category("a coffee machine for my kitchen") == "coffee machine"
+    assert _fallback_category("buy me a coffee machine") == "coffee machine"
+    assert _fallback_category("a foam roller for my back") == "foam roller"
+    assert _fallback_category("cheap running shoes under 5000") == "running shoes"
+
+
+def test_a_request_that_is_only_qualifiers_still_yields_a_scope():
+    """Degenerate input must not produce an empty scope: an empty category
+    would match nothing and the refusal would read as a crypto failure."""
+    assert _fallback_category("for my kitchen")
+    assert _fallback_category("") == "general"

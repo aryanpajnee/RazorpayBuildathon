@@ -149,11 +149,13 @@ def prepare_consent(
     body: ConsentPrepareBody,
     credential: DeviceToken,
 ) -> ConsentPrepareResponse:
-    category = (
-        config.CONSENT_OFFLINE_CATEGORY
-        if body.mode == "offline"
-        else consent_category(body.request)
-    )
+    # The scope is read off the user's own words in BOTH modes. It used to be
+    # pinned to a constant for offline runs, which meant a person asking for a
+    # coffee machine signed an authority for footwear and then watched Vera buy
+    # shoes -- the run reported success, so the lie was invisible. "Simulated"
+    # constrains where candidates come from (a fixture set, no live web calls);
+    # it was never meant to constrain what the user is allowed to ask for.
+    category = consent_category(body.request)
     prepared = CONSENT_STORE.prepare(
         credential,
         request=body.request,

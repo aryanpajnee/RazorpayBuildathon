@@ -53,13 +53,44 @@ _STOP = {
 }
 _PRICE_RE = re.compile(r"(?:₹|rs\.?|inr)?\s*\d[\d,]*(?:\.\d+)?k?", re.IGNORECASE)
 
+# Prepositions that introduce a purpose/qualifier clause rather than more of the
+# product name: "a coffee machine FOR my kitchen", "shoes UNDER 3000". Matched on
+# word boundaries so "formal" is not mistaken for "for".
+_PURPOSE_RE = re.compile(
+    r"\b(?:for|to|with|without|under|below|above|over|around|about|upto|up\s+to|"
+    r"that|which|so)\b",
+    re.IGNORECASE,
+)
+
 
 def _fallback_category(request: str) -> str:
     """Deterministic label from the request text, no LLM. Drops price tokens and
     filler words and keeps the last few remaining words — the product noun tends
-    to sit at the end of an English request ("buy me wireless HEADPHONES")."""
+    to sit at the end of an English request ("buy me wireless HEADPHONES").
+
+    The "last few words" rule alone mis-reads a request that ends in a purpose
+    phrase: "a coffee machine for my kitchen" came out as "coffee machine
+    kitchen", because "for"/"my" are filler and get dropped rather than being
+    read as the boundary they actually are. The user then sees that phrase as
+    the scope on the consent screen and signs it. So the purpose clause is cut
+    FIRST, on the preposition, and only the head is labelled.
+
+    Rejected alternative: asking the LLM to do this. `consent_category` runs on
+    the request path that prepares the bytes a human is about to sign, and it
+    must be instant, offline and identical on every call — a model that names
+    the scope differently on a retry would change what the user is signing.
+    `understand_request` is where the model gets to name the scope; this stays
+    dumb on purpose.
+    """
     text = _PRICE_RE.sub(" ", request or "")
-    words = [w for w in re.findall(r"[a-zA-Z][a-zA-Z-]*", text.lower()) if w not in _STOP]
+    # Cut at the first purpose/qualifier preposition: everything after it
+    # describes why or how much, not what.
+    head = _PURPOSE_RE.split(text, maxsplit=1)[0]
+    words = [w for w in re.findall(r"[a-zA-Z][a-zA-Z-]*", head.lower()) if w not in _STOP]
+    if not words:
+        # The request was nothing but qualifiers — fall back to the whole text
+        # rather than returning an empty scope nothing could ever match.
+        words = [w for w in re.findall(r"[a-zA-Z][a-zA-Z-]*", text.lower()) if w not in _STOP]
     if not words:
         return normalize_category(request) or "general"
     return normalize_category(" ".join(words[-3:]))

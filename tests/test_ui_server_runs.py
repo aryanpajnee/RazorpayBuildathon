@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from nacl.signing import SigningKey
 
 import config
+from demo.intent import consent_category
 from core.mandate import canonical, sign
 from merchant.user_registry import UserRegistry
 from ui import server
@@ -143,7 +144,9 @@ def test_prepare_returns_the_exact_canonical_bytes_to_sign(run_client):
     assert body["canonical_payload"] == canonical(body["payload"]).decode("utf-8")
     assert body["payload"]["request"] == "running shoes"
     assert body["payload"]["mode"] == "offline"
-    assert body["payload"]["category"] == config.CONSENT_OFFLINE_CATEGORY
+    # The signed scope comes from the request itself, in offline mode too --
+    # an offline run must not silently re-scope the user to a fixed category.
+    assert body["payload"]["category"] == consent_category("running shoes")
     assert body["payload"]["max_purchases"] == 1
 
 
