@@ -25,3 +25,6 @@ plan.md
 # Local scratch / tool output
 scratch_vite.log
 .playwright-mcp/
+
+# Codex parallel-agent worktrees (git worktrees of this repo; never commit)
+worktrees/
